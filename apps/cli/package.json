@@ -1,0 +1,8 @@
+{
+  "name": "liberde-cli",
+  "version": "0.1.0",
+  "description": "Terminal chat client for a Liberde server",
+  "type": "module",
+  "bin": { "liberde": "./liberde.mjs" },
+  "engines": { "node": ">=18" }
+}

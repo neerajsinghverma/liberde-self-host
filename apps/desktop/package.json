@@ -1,0 +1,20 @@
+{
+  "name": "liberde-desktop",
+  "version": "0.1.0",
+  "description": "Liberde desktop app",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "app.liberde.desktop",
+    "productName": "Liberde",
+    "files": ["main.js"],
+    "win": { "target": "nsis" }
+  }
+}
