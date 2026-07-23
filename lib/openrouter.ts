@@ -51,6 +51,8 @@ export function getSettings(userId?: string) {
     /** Built-in response style preset: normal | concise | explanatory | formal | learning */
     responseStyle: getSetting("response_style", userId) || "normal",
     memoryEnabled: getSetting("memory_enabled", userId) !== "0",
+    /** Let the model search the user's own past chats (default on; toggleable). */
+    recallEnabled: getSetting("recall_enabled", userId) !== "0",
     monthlyBudget: Number(getSetting("monthly_budget", userId) ?? "0") || 0,
     temperature: Number(getSetting("temperature", userId) ?? "1"),
   };

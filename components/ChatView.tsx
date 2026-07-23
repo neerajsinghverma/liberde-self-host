@@ -5,6 +5,7 @@ import type {
   AppSettings,
   Attachment,
   Conversation,
+  DesignSystem,
   Message,
   ModelInfo,
   Project,
@@ -22,6 +23,8 @@ import Markdown, { type CodePreview } from "./Markdown";
 import Icon from "./Icon";
 import ModelPicker from "./ModelPicker";
 import ModelAdvisor from "./ModelAdvisor";
+import ComparePanel from "./ComparePanel";
+import DesignSystemChip from "./DesignSystemChip";
 import ArtifactPanel, {
   typeIcon,
   type ArtifactWithVersions,
@@ -43,6 +46,10 @@ interface Props {
   projects: Project[];
   onConversationCreated: (c: Conversation) => void;
   onConversationsChanged: () => void;
+  /** Open the sidebar (mobile hamburger). */
+  onOpenSidebar?: () => void;
+  /** Signed-in user's name, for the personalized welcome greeting. */
+  userName?: string;
   /** "chat" (default) or "design" — scopes new conversations to a workspace. */
   mode?: string;
 }
@@ -54,6 +61,8 @@ export default function ChatView({
   projects,
   onConversationCreated,
   onConversationsChanged,
+  onOpenSidebar,
+  userName,
   mode = "chat",
 }: Props) {
   const [convId, setConvId] = useState(conversationId);
@@ -84,6 +93,14 @@ export default function ChatView({
   const [memoryToast, setMemoryToast] = useState(false);
   const [modelNote, setModelNote] = useState<string | null>(null);
   const [showAdvisor, setShowAdvisor] = useState(false);
+  const [compareFor, setCompareFor] = useState<{
+    messageId: string;
+    question: string;
+  } | null>(null);
+  const [designSystems, setDesignSystems] = useState<DesignSystem[]>([]);
+  const [designSystemId, setDesignSystemId] = useState<string | null>(null);
+  const designSystemsRef = useRef<DesignSystem[]>([]);
+  const dsDefaultApplied = useRef(false);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -175,6 +192,7 @@ export default function ChatView({
       setConversation(data);
       setMessages(data.messages);
       setModel(data.model);
+      setDesignSystemId(data.design_system_id ?? null);
       loadArtifacts(id);
       // If a response is being generated but we're not the streaming client,
       // surface a working indicator and poll for the result.
@@ -202,6 +220,24 @@ export default function ChatView({
     isStreamingRef.current = isStreaming;
     if (isStreaming) stopBgPoll();
   }, [isStreaming, stopBgPoll]);
+
+  // Design systems: load the picker list in design mode; a brand-new design
+  // starts on the user's default system (existing conversations keep their
+  // stored choice, loaded in loadConversation).
+  useEffect(() => {
+    if (mode !== "design") return;
+    api<DesignSystem[]>("/api/design-systems")
+      .then((list) => {
+        setDesignSystems(list);
+        designSystemsRef.current = list;
+        if (!convIdRef.current && !dsDefaultApplied.current) {
+          dsDefaultApplied.current = true;
+          const def = list.find((s) => s.is_default);
+          if (def) setDesignSystemId((cur) => cur ?? def.id);
+        }
+      })
+      .catch(() => {});
+  }, [mode]);
 
   // Clean up the poll on unmount.
   useEffect(() => () => stopBgPoll(), [stopBgPoll]);
@@ -241,6 +277,9 @@ export default function ChatView({
       setConversation(null);
       setMessages([]);
       setModel("");
+      // A fresh design starts back on the user's default design system.
+      const def = designSystemsRef.current.find((s) => s.is_default);
+      setDesignSystemId(def ? def.id : null);
     }
   }, [conversationId, loadConversation, stopBgPoll]);
 
@@ -474,7 +513,12 @@ export default function ChatView({
       if (!id) {
         const conv = await api<Conversation>("/api/conversations", {
           method: "POST",
-          body: JSON.stringify({ model, temp: tempMode, mode }),
+          body: JSON.stringify({
+            model,
+            temp: tempMode,
+            mode,
+            ...(mode === "design" && designSystemId ? { designSystemId } : {}),
+          }),
         });
         id = conv.id;
         setConvId(id);
@@ -507,7 +551,7 @@ export default function ChatView({
             setIsStreaming(false);
             setStreamText("");
             setResearchStatuses([]);
-            notifyDone("Liberde", agentMode ? "Your agent finished" : "Your research is ready");
+            notifyDone("Liberde", agentMode ? "Your plan finished" : "Your research is ready");
             if (convIdRef.current === id) await loadConversation(id!);
             onConversationsChanged();
           },
@@ -598,6 +642,7 @@ export default function ChatView({
       agentMode,
       designImages,
       designImageModel,
+      designSystemId,
       mode,
       onConversationCreated,
       onConversationsChanged,
@@ -620,7 +665,16 @@ export default function ChatView({
     return () => window.removeEventListener("liberde-canvas", onCanvas);
   }, [isStreaming]);
 
-  const stop = () => abortRef.current?.();
+  const stop = () => {
+    abortRef.current?.();
+    abortRef.current = null;
+    setIsStreaming(false);
+    stopBgPoll();
+    // Also release the server-side lock so a stuck/background run is cleared
+    // and the user can send again immediately (Stop must actually stop).
+    const id = convIdRef.current;
+    if (id) api(`/api/conversations/${id}/cancel`, { method: "POST" }).catch(() => {});
+  };
 
   const regenerate = (withModel?: string) => {
     const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
@@ -708,6 +762,16 @@ export default function ChatView({
     }
   };
 
+  const changeDesignSystem = (id: string | null) => {
+    setDesignSystemId(id);
+    if (convId) {
+      api(`/api/conversations/${convId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ designSystemId: id }),
+      }).catch(() => {});
+    }
+  };
+
   const projectName = conversation?.project_id
     ? projects.find((p) => p.id === conversation.project_id)?.name
     : null;
@@ -738,6 +802,15 @@ export default function ChatView({
     )}
     <div className="flex min-w-0 flex-1 flex-col">
       <header className="flex flex-wrap items-center gap-2 border-b border-line px-3 py-2 md:gap-3 md:px-4">
+        {onOpenSidebar && (
+          <button
+            onClick={onOpenSidebar}
+            title="Open menu"
+            className="shrink-0 rounded-lg p-1.5 text-ink-muted hover:bg-surface-2 hover:text-ink md:hidden"
+          >
+            <Icon name="menu" size={20} />
+          </button>
+        )}
         <ModelPicker models={models} value={model} onChange={changeModel} />
         <button
           onClick={() => setShowAdvisor(true)}
@@ -764,6 +837,14 @@ export default function ChatView({
             models={models.filter((m) => m.outputsImages)}
             value={designImageModel || settings?.imageModel || ""}
             onChange={setDesignImageModel}
+          />
+        )}
+        {mode === "design" && (
+          <DesignSystemChip
+            systems={designSystems}
+            value={designSystemId}
+            onChange={changeDesignSystem}
+            compact
           />
         )}
         {projectName && (
@@ -880,6 +961,21 @@ export default function ChatView({
         />
       )}
 
+      {compareFor && convId && (
+        <ComparePanel
+          models={models}
+          conversationId={convId}
+          truncateFromMessageId={compareFor.messageId}
+          currentModel={model}
+          question={compareFor.question}
+          onClose={() => setCompareFor(null)}
+          onCommitted={(picked) => {
+            setModel(picked);
+            loadConversation(convId);
+          }}
+        />
+      )}
+
       {shareUrl && (
         <div className="flex items-center gap-2 border-b border-line bg-surface-2 px-4 py-2 text-sm">
           <span className="text-ink-muted">Public snapshot link (copied):</span>
@@ -911,18 +1007,25 @@ export default function ChatView({
 
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         {showWelcome && mode === "design" ? (
-          <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+          <div className="flex min-h-full flex-col items-center justify-center px-6 py-10 text-center">
             <div className="login-logo mb-3 grid h-14 w-14 place-items-center rounded-2xl bg-accent text-white">
               <Icon name="pencil" size={26} />
             </div>
             <h1 className="font-display text-4xl font-medium tracking-tight">
-              What should we design today?
+              {timeGreeting(userName)}
             </h1>
             <p className="mt-3 max-w-md text-sm text-ink-muted">
               Pick a starting point, or just describe it. I’ll ask a couple of quick
               questions, then build an interactive design on the canvas — tweak it in
               plain language after.
             </p>
+            <div className="mt-5">
+              <DesignSystemChip
+                systems={designSystems}
+                value={designSystemId}
+                onChange={changeDesignSystem}
+              />
+            </div>
             {settings?.hasApiKey && (
               <div className="mt-8 grid w-full max-w-3xl grid-cols-1 gap-2 sm:grid-cols-3">
                 {DESIGN_TEMPLATES.map((t) => (
@@ -940,14 +1043,10 @@ export default function ChatView({
             )}
           </div>
         ) : showWelcome ? (
-          <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+          <div className="flex min-h-full flex-col items-center justify-center px-6 py-10 text-center">
             <h1 className="font-display text-4xl font-medium tracking-tight">
-              What can I help with?
+              {timeGreeting(userName)}
             </h1>
-            <p className="mt-3 max-w-md text-sm text-ink-muted">
-              Liberde routes your chats to any model on OpenRouter — Claude, GPT,
-              Gemini, Llama, and hundreds more.
-            </p>
             {settings?.hasApiKey && (
               <div className="mt-8 grid max-w-2xl grid-cols-1 gap-2 sm:grid-cols-2">
                 {STARTER_PROMPTS.map((p) => (
@@ -1114,7 +1213,7 @@ export default function ChatView({
                     <Citations annotations={msg.annotations} />
                   )}
                   <div
-                    className={`mt-1.5 items-center gap-3 text-xs text-ink-muted ${
+                    className={`mt-1.5 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-muted ${
                       !isStreaming && messages[messages.length - 1]?.id === msg.id
                         ? "flex"
                         : "hidden group-hover:flex"
@@ -1122,15 +1221,7 @@ export default function ChatView({
                   >
                     {msg.model && <span>{msg.model}</span>}
                     {msg.cost != null && msg.cost > 0 && (
-                      <span
-                        title={
-                          msg.tokens_in
-                            ? `${msg.tokens_in} tokens in · ${msg.tokens_out ?? 0} tokens out`
-                            : undefined
-                        }
-                      >
-                        {fmtCost(msg.cost)}
-                      </span>
+                      <span title={costTooltip(msg)}>{fmtCost(msg.cost)}</span>
                     )}
                     <button
                       onClick={() => navigator.clipboard.writeText(msg.content)}
@@ -1139,14 +1230,29 @@ export default function ChatView({
                     >
                       <Icon name="copy" size={13} /> Copy
                     </button>
-                    <ReadAloudButton text={msg.content} />
                     {!isStreaming &&
                       messages[messages.length - 1]?.id === msg.id && (
-                        <RegenerateControl
-                          models={models}
-                          currentModel={model}
-                          onRegenerate={regenerate}
-                        />
+                        <>
+                          <RegenerateControl
+                            models={models}
+                            currentModel={model}
+                            onRegenerate={regenerate}
+                          />
+                          <button
+                            onClick={() => {
+                              const idx = messages.findIndex((m) => m.id === msg.id);
+                              const question =
+                                [...messages.slice(0, idx)]
+                                  .reverse()
+                                  .find((m) => m.role === "user")?.content ?? "";
+                              setCompareFor({ messageId: msg.id, question });
+                            }}
+                            title="Compare other models' answers to this question"
+                            className="inline-flex items-center gap-1 hover:text-ink"
+                          >
+                            <Icon name="sparkles" size={13} /> Second opinion
+                          </button>
+                        </>
                       )}
                   </div>
                 </div>
@@ -1209,11 +1315,17 @@ export default function ChatView({
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-accent" />
                 Liberde is working on this response… it&apos;ll appear here when
                 ready.
+                <button
+                  onClick={stop}
+                  className="ml-1 rounded border border-line px-2 py-0.5 text-xs hover:bg-surface-2 hover:text-ink"
+                >
+                  Stop
+                </button>
               </div>
             )}
 
             {error && (
-              <div className="mb-6 rounded-lg border border-red-300 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+              <div className="mb-6 max-h-48 overflow-y-auto overflow-x-hidden rounded-lg border border-red-300 bg-red-50 px-4 py-2 text-sm break-words whitespace-pre-wrap text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
                 {error}
               </div>
             )}
@@ -1469,6 +1581,31 @@ function fmtCost(cost: number): string {
   return `$${cost.toFixed(2)}`;
 }
 
+/** Hover text for a message's cost: tokens + where the money went. */
+function costTooltip(msg: Message): string | undefined {
+  const parts: string[] = [];
+  if (msg.tokens_in) {
+    parts.push(`${msg.tokens_in} tokens in · ${msg.tokens_out ?? 0} tokens out`);
+  }
+  try {
+    const bd = msg.cost_breakdown ? JSON.parse(msg.cost_breakdown) : null;
+    if (bd && typeof bd === "object") {
+      const labels: Record<string, string> = {
+        model: "model",
+        search: "web search",
+        image: "image",
+      };
+      const bits = Object.entries(bd)
+        .filter(([, v]) => typeof v === "number" && (v as number) > 0)
+        .map(([k, v]) => `${labels[k] ?? k} ${fmtCost(v as number)}`);
+      if (bits.length > 1) parts.push(bits.join(" · "));
+    }
+  } catch {
+    /* ignore malformed breakdown */
+  }
+  return parts.length ? parts.join("\n") : undefined;
+}
+
 function exportChat(title: string, messages: Message[]) {
   const lines: string[] = [`# ${title}`, ""];
   for (const m of messages) {
@@ -1549,6 +1686,42 @@ const STARTER_PROMPTS: { icon: string; label: string; prompt: string }[] = [
       "Create a beautiful 8-slide presentation introducing our team to the basics of large language models — title slide, agenda, clear visuals, and a closing takeaways slide.",
   },
 ];
+
+// A gentle, whimsical greeting that shifts with the time of day (and drifts a
+// little day to day) — like Claude's home greeting. Deterministic within a day
+// so it doesn't flicker across re-renders.
+// A rotating, whimsical greeting — time-of-day lines plus playful name-forward
+// ones (Claude-style: "Good evening, Neeraj", "Neeraj returns!", "Welcome
+// back"). `{n}` is the user's first name. Varies by hour + day so it drifts
+// through the set, but is stable within a given hour (no flicker on re-render).
+function timeGreeting(name?: string): string {
+  const now = new Date();
+  const h = now.getHours();
+  const first = name?.trim().split(/\s+/)[0] || "";
+  const timed =
+    h < 5
+      ? ["Still up, {n}", "Burning the midnight oil, {n}", "The night is yours, {n}"]
+      : h < 12
+        ? ["Good morning, {n}", "Morning, {n}", "Rise and shine, {n}"]
+        : h < 17
+          ? ["Good afternoon, {n}", "Afternoon, {n}", "Hey there, {n}"]
+          : h < 22
+            ? ["Good evening, {n}", "Evening, {n}", "Hope your day was good, {n}"]
+            : ["Winding down, {n}", "Still here, {n}", "One more, {n}?"];
+  // Time-agnostic, playful — only used when we know the name.
+  const playful = [
+    "{n} returns!",
+    "Welcome back, {n}",
+    "Look who's back — {n}",
+    "Back at it, {n}",
+    "Good to see you, {n}",
+    "Ready when you are, {n}",
+  ];
+  const pool = first ? [...timed, ...playful] : timed;
+  const chosen = pool[(now.getDate() * 5 + h + now.getDay()) % pool.length];
+  if (!first) return chosen.replace(/,?\s*\{n\}\??/g, "").trim() || "Hello";
+  return chosen.replace("{n}", first);
+}
 
 // Design-studio templates: each seeds a SHORT intent (not a full brief) so the
 // ask-first flow kicks in — clicking a card should interview you, then build.
@@ -1723,6 +1896,43 @@ type AskPart =
   | { type: "md"; value: string }
   | { type: "ask"; questions: AskQuestion[] };
 
+/** Parse an ask payload leniently — models emit arrays, bare objects,
+ *  {questions:[...]} wrappers, and code-fenced JSON. */
+function parseAskPayload(raw: string): AskQuestion[] | null {
+  let s = raw.trim();
+  s = s.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  const coerce = (parsed: unknown): AskQuestion[] | null => {
+    const qs = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray((parsed as { questions?: unknown[] })?.questions)
+        ? (parsed as { questions: unknown[] }).questions
+        : parsed && typeof parsed === "object" && typeof (parsed as AskQuestion).q === "string"
+          ? [parsed]
+          : null;
+    if (!qs) return null;
+    const clean = qs.filter(
+      (q): q is AskQuestion => Boolean(q) && typeof (q as AskQuestion).q === "string"
+    );
+    return clean.length ? clean : null;
+  };
+  try {
+    const result = coerce(JSON.parse(s));
+    if (result) return result;
+  } catch {
+    /* fall through to extraction */
+  }
+  // Salvage: first JSON array or object embedded in surrounding prose.
+  const embedded = s.match(/\[[\s\S]*\]/)?.[0] ?? s.match(/\{[\s\S]*\}/)?.[0];
+  if (embedded) {
+    try {
+      return coerce(JSON.parse(embedded));
+    } catch {
+      /* truly malformed */
+    }
+  }
+  return null;
+}
+
 /** Split assistant text into markdown and interactive <liberdeAsk> question blocks. */
 function splitAsk(text: string): AskPart[] {
   const parts: AskPart[] = [];
@@ -1731,12 +1941,16 @@ function splitAsk(text: string): AskPart[] {
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
     if (m.index > last) parts.push({ type: "md", value: text.slice(last, m.index) });
-    try {
-      const parsed = JSON.parse(m[1].trim());
-      const qs: AskQuestion[] = Array.isArray(parsed) ? parsed : parsed.questions;
-      if (Array.isArray(qs) && qs.length) parts.push({ type: "ask", questions: qs });
-    } catch {
-      /* malformed — drop it */
+    const qs = parseAskPayload(m[1]);
+    if (qs) {
+      parts.push({ type: "ask", questions: qs });
+    } else {
+      // Unsalvageable payload: show the questions' text as plain markdown
+      // rather than raw tags/JSON.
+      const qTexts = [...m[1].matchAll(/"q"\s*:\s*"([^"]+)"/g)].map((x) => x[1]);
+      if (qTexts.length) {
+        parts.push({ type: "md", value: qTexts.map((q) => `**${q}**`).join("\n\n") });
+      }
     }
     last = re.lastIndex;
   }
@@ -1744,7 +1958,10 @@ function splitAsk(text: string): AskPart[] {
   // Hide an unterminated block still streaming in.
   rest = rest.replace(/<liberdeAsk\b[\s\S]*$/, "");
   if (rest) parts.push({ type: "md", value: rest });
-  return parts.length ? parts : [{ type: "md", value: text }];
+  // Fallback for a fully-dropped message: never show raw <liberdeAsk> tags.
+  return parts.length
+    ? parts
+    : [{ type: "md", value: text.replace(/<\/?liberdeAsk>/g, "").trim() }];
 }
 
 function QuestionCard({
@@ -2085,36 +2302,6 @@ function Citations({ annotations }: { annotations: NonNullable<Message["annotati
         );
       })}
     </div>
-  );
-}
-
-function ReadAloudButton({ text }: { text: string }) {
-  const [speaking, setSpeaking] = useState(false);
-  const toggle = () => {
-    if (typeof speechSynthesis === "undefined") return;
-    if (speaking) {
-      speechSynthesis.cancel();
-      setSpeaking(false);
-      return;
-    }
-    // Strip markdown/code noise for listenable output.
-    const plain = text
-      .replace(/<liberdeArtifact[\s\S]*?(<\/liberdeArtifact>|$)/g, " (artifact) ")
-      .replace(/```[\s\S]*?```/g, " (code block) ")
-      .replace(/[*_#`>|-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    const utterance = new SpeechSynthesisUtterance(plain.slice(0, 4000));
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
-    speechSynthesis.speak(utterance);
-    setSpeaking(true);
-  };
-  return (
-    <button onClick={toggle} className="inline-flex items-center gap-1 hover:text-ink">
-      <Icon name={speaking ? "stop" : "volume"} size={13} />
-      {speaking ? "Stop" : "Read aloud"}
-    </button>
   );
 }
 
@@ -2487,9 +2674,9 @@ function Composer({
               <ComposerToggle
                 on={agentMode}
                 onClick={onToggleAgentMode}
-                title="Agent mode: plans your goal into steps, executes each with tools, delivers the result"
+                title="Plan: breaks your goal into steps, executes each with tools, and delivers the result"
               >
-                <Icon name="sparkles" size={14} /> Agent
+                <Icon name="sparkles" size={14} /> Plan
               </ComposerToggle>
               <button
                 title={

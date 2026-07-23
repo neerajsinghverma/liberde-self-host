@@ -1,9 +1,11 @@
 import { NextRequest } from "next/server";
 import {
   addMessage,
+  canAccessDesignSystem,
   deleteMessagesFrom,
   getApiKey,
   getConversation,
+  getDesignSystem,
   getProject,
   listMessages,
   listProjectFiles,
@@ -62,6 +64,12 @@ import {
   PLATFORM_TOOL_DEFS,
   PLATFORM_TOOLS_PROMPT,
 } from "@/lib/platform-tools";
+import {
+  execRecallTool,
+  isRecallTool,
+  RECALL_SYSTEM_PROMPT,
+  RECALL_TOOL_DEFS,
+} from "@/lib/recall";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -232,6 +240,8 @@ export async function POST(req: NextRequest) {
 
   // Memory is skipped entirely in temporary chats (nothing is remembered from them).
   const memoryActive = settings.memoryEnabled && !conversation.is_temp;
+  // Recall: let the model search the user's own past chats (skipped in temp chats).
+  const recallActive = settings.recallEnabled && !conversation.is_temp;
 
   const designMode = conversation.mode === "design";
   // Design imagery: "new way" = AI-generate assets via the image model (opt-in);
@@ -248,6 +258,7 @@ export async function POST(req: NextRequest) {
     ARTIFACT_READ_TOOL,
     ...(designImages ? [DESIGN_IMAGE_TOOL] : []),
     ...(memoryActive ? MEMORY_TOOL_DEFS : []),
+    ...(recallActive ? RECALL_TOOL_DEFS : []),
     ...mcpTools,
   ];
   const designDirective =
@@ -281,9 +292,26 @@ When the user asks for a change, edit ONLY what they asked and PRESERVE everythi
 
 Only reply in plain text for a genuine question that clearly isn't a design request.`
       : "";
+  // Active design system: pinned per-conversation; owner or share recipient may
+  // apply it. A stale/revoked id degrades to no system rather than failing.
+  let designSystemBlock = "";
+  if (designMode && conversation.design_system_id) {
+    try {
+      const ds = await getDesignSystem(conversation.design_system_id);
+      if (ds && (await canAccessDesignSystem(ds.id, userId))) {
+        designSystemBlock = `# Active design system: ${ds.name}
+The user selected this design system for this conversation. Every artifact you build MUST follow it — declare its palette as CSS custom properties in :root, use its fonts (via Google Fonts <link>), spacing rhythm, and component styles throughout. When asking clarifying questions, skip questions the system already answers (colors, fonts, vibe). Before finishing an artifact, re-check it against the system (palette, typography, spacing, components) and fix any drift. If the user explicitly asks to deviate from the system, the user wins.
+
+${ds.spec}`;
+      }
+    } catch (e) {
+      console.error("design system load failed (continuing without):", e);
+    }
+  }
   const styleDirective = STYLE_PRESETS[settings.responseStyle]?.directive ?? "";
   const fullSystemPrompt = [
     designDirective,
+    designSystemBlock,
     styleDirective,
     systemPrompt,
     memoryActive ? await buildMemoryContext(userId) : "",
@@ -291,6 +319,7 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
     ANALYSIS_SYSTEM_PROMPT,
     WEB_TOOLS_PROMPT,
     PLATFORM_TOOLS_PROMPT,
+    recallActive ? RECALL_SYSTEM_PROMPT : "",
     '# Clarifying\nIf a request is genuinely ambiguous or missing details needed to do it well (especially before substantial work), ask clarifying questions first instead of guessing. When you ask, emit them as an interactive block the interface turns into clickable options: <liberdeAsk>[{"q":"question?","options":["Option A","Option B"],"multi":false}]</liberdeAsk> — 1-3 questions, each with 2-4 concrete options. For simple or clear requests, just answer — do not over-ask.',
     memoryActive ? MEMORY_SYSTEM_PROMPT : "",
   ]
@@ -381,6 +410,10 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
       let reasoningStartedAt: number | null = null;
       let reasoningEndedAt: number | null = null;
       let totalCost = preSearchCost;
+      // Cost attribution: how much of this turn went to web search vs the
+      // model itself (surfaced on the Usage page and the message tooltip).
+      let searchCost = preSearchCost;
+      let pluginResults = 0;
       let totalTokensIn = 0;
       let totalTokensOut = 0;
 
@@ -415,6 +448,20 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
             reasoningStartedAt != null
               ? Math.max(0, (reasoningEndedAt ?? Date.now()) - reasoningStartedAt)
               : null;
+          // The OpenRouter web plugin bills ~$4 per 1000 results, bundled into
+          // the request cost — estimate the search share from returned results.
+          if (body.webSearch && target.isOpenRouter && pluginResults > 0) {
+            searchCost += Math.min(
+              pluginResults * 0.004,
+              Math.max(0, totalCost - searchCost)
+            );
+          }
+          const costBreakdown = totalCost
+            ? JSON.stringify({
+                model: Math.max(0, totalCost - searchCost),
+                ...(searchCost > 0 ? { search: Math.min(searchCost, totalCost) } : {}),
+              })
+            : null;
           const saved = await addMessage(conversation.id, "assistant", content, model, null, {
             reasoning: finalReasoning || null,
             annotations: finalAnnotations.length ? finalAnnotations : null,
@@ -423,6 +470,7 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
             cost: totalCost || null,
             tokens_in: totalTokensIn || null,
             tokens_out: totalTokensOut || null,
+            cost_breakdown: costBreakdown,
           });
           savedId = saved.id;
           try {
@@ -617,6 +665,7 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
                   choice?.delta?.annotations ?? choice?.message?.annotations;
                 if (Array.isArray(newAnnotations) && newAnnotations.length) {
                   finalAnnotations.push(...newAnnotations);
+                  pluginResults += newAnnotations.length;
                   emit({ annotations: newAnnotations });
                 }
                 const tcDeltas = choice?.delta?.tool_calls;
@@ -793,6 +842,8 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
               output = await execArtifactRead(conversation.id, call.function.arguments);
             } else if (isMemoryTool(call.function.name)) {
               output = await execMemoryTool(call.function.name, call.function.arguments, userId);
+            } else if (isRecallTool(call.function.name)) {
+              output = await execRecallTool(call.function.name, call.function.arguments, userId);
             } else if (isPlatformTool(call.function.name)) {
               const result = await execPlatformTool(
                 call.function.name,
@@ -812,6 +863,7 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
                   ARTIFACT_READ_TOOL,
                   ...(designImages ? [DESIGN_IMAGE_TOOL] : []),
                   ...(memoryActive ? MEMORY_TOOL_DEFS : []),
+                  ...(recallActive ? RECALL_TOOL_DEFS : []),
                   ...refreshedMcp
                 );
               }
@@ -823,6 +875,8 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
               );
               output = result.output;
               totalCost += result.cost ?? 0;
+              // Builtin tools that bill are the web tools — attribute to search.
+              searchCost += result.cost ?? 0;
               if (result.annotations.length) {
                 finalAnnotations.push(...result.annotations);
                 emit({ annotations: result.annotations });

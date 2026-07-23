@@ -7,6 +7,7 @@ import type {
   AgentStep,
   Attachment,
   Conversation,
+  DesignSystem,
   Message,
   Project,
   ProjectFile,
@@ -266,6 +267,35 @@ function createDb(): Database.Database {
       created_at INTEGER NOT NULL
     );
   `);
+  // Design systems: named brand specs applied to Design-mode builds, plus
+  // user-to-user shares for systems and artifacts (project_members pattern).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS design_systems (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL DEFAULT 'local',
+      name TEXT NOT NULL,
+      spec TEXT NOT NULL,
+      palette TEXT,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS design_system_shares (
+      design_system_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      added_at INTEGER NOT NULL,
+      PRIMARY KEY (design_system_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS artifact_shares (
+      artifact_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      added_at INTEGER NOT NULL,
+      PRIMARY KEY (artifact_id, user_id)
+    );
+  `);
+  ensureColumn(db, "conversations", "design_system_id", "TEXT");
+  // Cost attribution: JSON {"model":n,"search":n,"image":n} per assistant turn.
+  ensureColumn(db, "messages", "cost_breakdown", "TEXT");
 
   // Indexes for per-user / per-parent lookups. All referenced tables + columns
   // exist by now; each guarded so one failure can't wedge startup.
@@ -400,6 +430,8 @@ export interface UsageStats {
   total: { cost: number; tokensIn: number; tokensOut: number; messages: number };
   byModel: { model: string; n: number; cost: number; tin: number; tout: number }[];
   byDay: { day: number; cost: number; n: number }[];
+  /** Spend by category: model | search | image (from per-message breakdowns). */
+  byCategory: Record<string, number>;
 }
 
 /** Aggregate this user's assistant-message spend for the usage dashboard. */
@@ -431,7 +463,37 @@ export function usageStats(userId: string = DEFAULT_USER): UsageStats {
     }),
     { cost: 0, tokensIn: 0, tokensOut: 0, messages: 0 }
   );
-  return { total, byModel: byModel.map((r) => ({ ...r, model: r.model || "unknown" })), byDay };
+  // Where the money goes: sum per-message cost_breakdown JSON. Messages from
+  // before attribution existed (no breakdown) count as plain model spend.
+  const bdRows = db
+    .prepare(
+      `SELECT m.cost AS cost, m.cost_breakdown AS cost_breakdown FROM messages m
+       JOIN conversations c ON c.id = m.conversation_id
+       WHERE c.user_id = ? AND m.role = 'assistant' AND m.cost > 0`
+    )
+    .all(userId) as { cost: number; cost_breakdown: string | null }[];
+  const byCategory: Record<string, number> = {};
+  for (const r of bdRows) {
+    let bd: Record<string, number> | null = null;
+    try {
+      bd = r.cost_breakdown ? JSON.parse(r.cost_breakdown) : null;
+    } catch {
+      bd = null;
+    }
+    if (bd && typeof bd === "object") {
+      for (const [k, v] of Object.entries(bd)) {
+        if (typeof v === "number" && v > 0) byCategory[k] = (byCategory[k] ?? 0) + v;
+      }
+    } else {
+      byCategory.model = (byCategory.model ?? 0) + (r.cost || 0);
+    }
+  }
+  return {
+    total,
+    byModel: byModel.map((r) => ({ ...r, model: r.model || "unknown" })),
+    byDay,
+    byCategory,
+  };
 }
 
 export interface PromptRecord {
@@ -516,6 +578,34 @@ export function searchAll(query: string, userId: string = DEFAULT_USER): {
   return { conversations: searchConversations(query, userId), projects, artifacts };
 }
 
+export interface RecallHit {
+  conversation_id: string;
+  title: string;
+  role: string;
+  content: string;
+  created_at: number;
+}
+
+/** Recall: find message excerpts across the user's past (non-temp) chats that
+ *  match a query — used by the model-callable "search_past_chats" tool. */
+export function searchPastMessages(
+  query: string,
+  userId: string = DEFAULT_USER,
+  limit = 8
+): RecallHit[] {
+  const like = `%${query.replace(/[%_]/g, "\\$&")}%`;
+  return db
+    .prepare(
+      `SELECT c.id AS conversation_id, c.title AS title, m.role AS role,
+              m.content AS content, m.created_at AS created_at
+       FROM messages m JOIN conversations c ON c.id = m.conversation_id
+       WHERE c.user_id = ? AND c.is_temp = 0 AND m.role IN ('user','assistant')
+         AND m.content LIKE ? ESCAPE '\\'
+       ORDER BY m.created_at DESC LIMIT ?`
+    )
+    .all(userId, like, limit) as RecallHit[];
+}
+
 /** Full-text search across conversation titles and message content. */
 export function searchConversations(
   query: string,
@@ -565,7 +655,10 @@ export function createConversation(
 export function updateConversation(
   id: string,
   fields: Partial<
-    Pick<Conversation, "title" | "model" | "project_id" | "starred" | "archived">
+    Pick<
+      Conversation,
+      "title" | "model" | "project_id" | "starred" | "archived" | "design_system_id"
+    >
   >
 ) {
   const conv = getConversation(id);
@@ -573,12 +666,13 @@ export function updateConversation(
   const merged = {
     starred: 0,
     archived: 0,
+    design_system_id: null as string | null,
     ...conv,
     ...fields,
     updated_at: now(),
   };
   db.prepare(
-    "UPDATE conversations SET title = @title, model = @model, project_id = @project_id, starred = @starred, archived = @archived, updated_at = @updated_at WHERE id = @id"
+    "UPDATE conversations SET title = @title, model = @model, project_id = @project_id, starred = @starred, archived = @archived, design_system_id = @design_system_id, updated_at = @updated_at WHERE id = @id"
   ).run(merged);
 }
 
@@ -631,6 +725,7 @@ export function addMessage(
     cost?: number | null;
     tokens_in?: number | null;
     tokens_out?: number | null;
+    cost_breakdown?: string | null;
   } = {}
 ): Message {
   const msg: Message = {
@@ -649,10 +744,11 @@ export function addMessage(
     cost: extras.cost ?? null,
     tokens_in: extras.tokens_in ?? null,
     tokens_out: extras.tokens_out ?? null,
+    cost_breakdown: extras.cost_breakdown ?? null,
     created_at: now(),
   };
   db.prepare(
-    "INSERT INTO messages (id, conversation_id, role, content, model, attachments, reasoning, annotations, images, tool_calls, tool_call_id, reasoning_ms, cost, tokens_in, tokens_out, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO messages (id, conversation_id, role, content, model, attachments, reasoning, annotations, images, tool_calls, tool_call_id, reasoning_ms, cost, tokens_in, tokens_out, cost_breakdown, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(
     msg.id,
     msg.conversation_id,
@@ -669,6 +765,7 @@ export function addMessage(
     msg.cost,
     msg.tokens_in,
     msg.tokens_out,
+    msg.cost_breakdown,
     msg.created_at
   );
   touchConversation(conversationId);
@@ -1032,6 +1129,193 @@ export function removeProjectMember(projectId: string, userId: string) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Design systems — named brand specs applied to Design-mode builds. A user can
+// have many; at most one is the default. Shares follow the project_members
+// pattern: recipients get read-only access (they can apply or copy, not edit).
+
+export function createDesignSystem(
+  userId: string,
+  data: { name: string; spec: string; palette?: string | null; isDefault?: boolean }
+): DesignSystem {
+  const ds: DesignSystem = {
+    id: newId(),
+    user_id: userId,
+    name: data.name,
+    spec: data.spec,
+    palette: data.palette ?? null,
+    is_default: data.isDefault ? 1 : 0,
+    created_at: now(),
+    updated_at: now(),
+  };
+  if (data.isDefault) {
+    db.prepare("UPDATE design_systems SET is_default = 0 WHERE user_id = ?").run(userId);
+  }
+  db.prepare(
+    `INSERT INTO design_systems (id, user_id, name, spec, palette, is_default, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(ds.id, ds.user_id, ds.name, ds.spec, ds.palette, ds.is_default, ds.created_at, ds.updated_at);
+  return ds;
+}
+
+/** Own systems plus ones shared with the user (marked shared + owner name). */
+export function listDesignSystems(userId: string): DesignSystem[] {
+  const own = db
+    .prepare(
+      "SELECT * FROM design_systems WHERE user_id = ? ORDER BY is_default DESC, updated_at DESC"
+    )
+    .all(userId) as DesignSystem[];
+  const shared = db
+    .prepare(
+      `SELECT d.*, u.name AS owner_name FROM design_system_shares s
+       JOIN design_systems d ON d.id = s.design_system_id
+       JOIN users u ON u.id = d.user_id
+       WHERE s.user_id = ? ORDER BY d.updated_at DESC`
+    )
+    .all(userId) as DesignSystem[];
+  return [...own, ...shared.map((s) => ({ ...s, shared: true, is_default: 0 }))];
+}
+
+export function getDesignSystem(id: string): DesignSystem | undefined {
+  return db.prepare("SELECT * FROM design_systems WHERE id = ?").get(id) as
+    | DesignSystem
+    | undefined;
+}
+
+/** Owner or share recipient can read/apply the system. */
+export function canAccessDesignSystem(id: string, userId: string): boolean {
+  const ds = getDesignSystem(id);
+  if (!ds) return false;
+  if (ds.user_id === userId) return true;
+  return Boolean(
+    db
+      .prepare(
+        "SELECT 1 FROM design_system_shares WHERE design_system_id = ? AND user_id = ?"
+      )
+      .get(id, userId)
+  );
+}
+
+export function updateDesignSystem(
+  id: string,
+  fields: Partial<Pick<DesignSystem, "name" | "spec" | "palette">>
+) {
+  const ds = getDesignSystem(id);
+  if (!ds) return;
+  const merged = { ...ds, ...fields, updated_at: now() };
+  db.prepare(
+    "UPDATE design_systems SET name = @name, spec = @spec, palette = @palette, updated_at = @updated_at WHERE id = @id"
+  ).run(merged);
+}
+
+/** Make `id` the user's default (or clear the default entirely with null). */
+export function setDefaultDesignSystem(userId: string, id: string | null) {
+  db.prepare("UPDATE design_systems SET is_default = 0 WHERE user_id = ?").run(userId);
+  if (id) {
+    db.prepare(
+      "UPDATE design_systems SET is_default = 1 WHERE id = ? AND user_id = ?"
+    ).run(id, userId);
+  }
+}
+
+export function deleteDesignSystem(id: string) {
+  db.prepare("DELETE FROM design_system_shares WHERE design_system_id = ?").run(id);
+  db.prepare("DELETE FROM design_systems WHERE id = ?").run(id);
+}
+
+export function shareDesignSystem(id: string, recipientId: string) {
+  db.prepare(
+    "INSERT OR IGNORE INTO design_system_shares (design_system_id, user_id, added_at) VALUES (?, ?, ?)"
+  ).run(id, recipientId, now());
+}
+
+export function unshareDesignSystem(id: string, recipientId: string) {
+  db.prepare(
+    "DELETE FROM design_system_shares WHERE design_system_id = ? AND user_id = ?"
+  ).run(id, recipientId);
+}
+
+export function listDesignSystemShares(
+  id: string
+): { user_id: string; email: string; name: string }[] {
+  return db
+    .prepare(
+      `SELECT s.user_id, u.email, u.name FROM design_system_shares s
+       JOIN users u ON u.id = s.user_id WHERE s.design_system_id = ? ORDER BY s.added_at ASC`
+    )
+    .all(id) as { user_id: string; email: string; name: string }[];
+}
+
+// ---------------------------------------------------------------------------
+// Artifact shares — user-to-user. Recipients see the artifact in "Shared with
+// you" and can open it as an editable copy in their own Design workspace.
+
+export function shareArtifactWithUser(artifactId: string, recipientId: string) {
+  db.prepare(
+    "INSERT OR IGNORE INTO artifact_shares (artifact_id, user_id, added_at) VALUES (?, ?, ?)"
+  ).run(artifactId, recipientId, now());
+}
+
+export function unshareArtifactWithUser(artifactId: string, recipientId: string) {
+  db.prepare("DELETE FROM artifact_shares WHERE artifact_id = ? AND user_id = ?").run(
+    artifactId,
+    recipientId
+  );
+}
+
+export function listArtifactShares(
+  artifactId: string
+): { user_id: string; email: string; name: string }[] {
+  return db
+    .prepare(
+      `SELECT s.user_id, u.email, u.name FROM artifact_shares s
+       JOIN users u ON u.id = s.user_id WHERE s.artifact_id = ? ORDER BY s.added_at ASC`
+    )
+    .all(artifactId) as { user_id: string; email: string; name: string }[];
+}
+
+/** True when the artifact was shared to this user (not ownership). */
+export function isArtifactSharedWith(artifactId: string, userId: string): boolean {
+  return Boolean(
+    db
+      .prepare("SELECT 1 FROM artifact_shares WHERE artifact_id = ? AND user_id = ?")
+      .get(artifactId, userId)
+  );
+}
+
+/** Artifacts shared with the user, newest first, with the owner's name. */
+export function listArtifactsSharedWith(userId: string): {
+  artifact_id: string;
+  identifier: string;
+  type: string;
+  title: string;
+  language: string | null;
+  owner_name: string;
+  shared_at: number;
+  updated_at: number;
+}[] {
+  return db
+    .prepare(
+      `SELECT a.id AS artifact_id, a.identifier, a.type, a.title, a.language,
+              u.name AS owner_name, s.added_at AS shared_at, a.updated_at
+       FROM artifact_shares s
+       JOIN artifacts a ON a.id = s.artifact_id
+       JOIN conversations c ON c.id = a.conversation_id
+       JOIN users u ON u.id = c.user_id
+       WHERE s.user_id = ? ORDER BY s.added_at DESC`
+    )
+    .all(userId) as {
+    artifact_id: string;
+    identifier: string;
+    type: string;
+    title: string;
+    language: string | null;
+    owner_name: string;
+    shared_at: number;
+    updated_at: number;
+  }[];
+}
+
 export function getProject(id: string): Project | undefined {
   return db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as
     | Project
@@ -1357,7 +1641,7 @@ export function deleteSharedChatsFor(conversationId: string) {
 export interface ProviderRecord {
   id: string;
   user_id: string;
-  kind: "azure" | "bedrock" | "google" | "custom";
+  kind: "openai" | "anthropic" | "azure" | "bedrock" | "google" | "custom";
   name: string;
   config: string; // JSON: endpoint/region/apiKey/apiVersion/models[]
   enabled: number;

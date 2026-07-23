@@ -24,3 +24,5 @@ next-env.d.ts
 coverage/
 .idea/
 .vscode/
+
+.vercel

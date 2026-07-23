@@ -3,7 +3,7 @@
 import { confirmDialog } from "@/lib/ui";
 import { useEffect, useState } from "react";
 import type { AppSettings, ModelInfo } from "@/lib/types";
-import { api } from "@/lib/client";
+import { api, fileToUploadAttachment } from "@/lib/client";
 import Icon from "./Icon";
 
 interface PlatformKey {
@@ -15,20 +15,56 @@ interface PlatformKey {
   key?: string;
 }
 
+type SettingsTabId =
+  | "general"
+  | "personalization"
+  | "providers"
+  | "connectors"
+  | "skills"
+  | "prompts"
+  | "design-systems"
+  | "keys"
+  | "admin";
+
+// Tab rail config (Claude-style): grouped, icon'd, with search keywords so the
+// search box can match on more than the visible label.
+const SETTINGS_TABS: {
+  id: SettingsTabId;
+  label: string;
+  icon: string;
+  group: "Settings" | "Customize";
+  keywords: string;
+}[] = [
+  { id: "general", label: "General", icon: "settings", group: "Settings", keywords: "model default title image transcribe temperature budget appearance theme api key openrouter" },
+  { id: "personalization", label: "Personal", icon: "star", group: "Settings", keywords: "about you name style instructions memory recall past chats push notifications response" },
+  { id: "providers", label: "Providers", icon: "wrench", group: "Settings", keywords: "azure bedrock aws google gemini vertex custom openai compatible groq ollama endpoint clouds" },
+  { id: "keys", label: "Keys", icon: "key", group: "Settings", keywords: "api platform key cli token v1 external apps" },
+  { id: "admin", label: "Admin", icon: "users", group: "Settings", keywords: "users signups accounts members administration" },
+  { id: "connectors", label: "Connectors", icon: "globe", group: "Customize", keywords: "mcp server tools deepwiki context7 remote http stdio" },
+  { id: "skills", label: "Skills", icon: "book", group: "Customize", keywords: "skill instructions reusable" },
+  { id: "prompts", label: "Prompts", icon: "message", group: "Customize", keywords: "prompt template saved snippet" },
+  { id: "design-systems", label: "Design systems", icon: "palette", group: "Customize", keywords: "brand colors palette typography fonts design system style guide share" },
+];
+
 export default function SettingsDialog({
   settings,
   models,
   onClose,
   onSaved,
+  initialTab,
 }: {
   settings: AppSettings;
   models: ModelInfo[];
   onClose: () => void;
   onSaved: (s: AppSettings) => void;
+  initialTab?: string;
 }) {
-  const [tab, setTab] = useState<
-    "general" | "personalization" | "providers" | "connectors" | "skills" | "prompts" | "keys" | "admin"
-  >("general");
+  const [tab, setTab] = useState<SettingsTabId>(
+    SETTINGS_TABS.some((t) => t.id === initialTab)
+      ? (initialTab as SettingsTabId)
+      : "general"
+  );
+  const [tabSearch, setTabSearch] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [defaultModel, setDefaultModel] = useState(settings.defaultModel);
   const [titleModel, setTitleModel] = useState(settings.titleModel);
@@ -43,6 +79,7 @@ export default function SettingsDialog({
   );
   const [responseStyle, setResponseStyle] = useState(settings.responseStyle ?? "normal");
   const [memoryEnabled, setMemoryEnabled] = useState(settings.memoryEnabled ?? true);
+  const [recallEnabled, setRecallEnabled] = useState(settings.recallEnabled ?? true);
   const [memories, setMemories] = useState<
     { id: string; content: string; created_at: number }[]
   >([]);
@@ -125,6 +162,7 @@ export default function SettingsDialog({
           styleInstructions,
           responseStyle,
           memoryEnabled,
+          recallEnabled,
           temperature,
           monthlyBudget: Number(monthlyBudget) || 0,
         }),
@@ -159,40 +197,64 @@ export default function SettingsDialog({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="flex h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-line bg-surface shadow-2xl">
-        <div className="flex items-center justify-between border-b border-line px-5 py-3">
-          <h2 className="font-display text-lg font-semibold">Settings</h2>
-          <button onClick={onClose} className="text-ink-muted hover:text-ink">✕</button>
+      <div className="flex h-[68vh] max-h-[calc(100dvh-2rem)] w-full max-w-4xl overflow-hidden rounded-2xl border border-line bg-surface shadow-2xl max-md:h-[85vh] max-md:flex-col">
+        {/* Tab rail — left sidebar on desktop, scrollable top bar on mobile */}
+        <div className="flex shrink-0 flex-col border-line md:w-56 md:border-r max-md:border-b">
+          <div className="flex items-center justify-between px-4 pt-4 pb-2">
+            <h2 className="font-display text-lg font-semibold">Settings</h2>
+            <button onClick={onClose} className="text-ink-muted hover:text-ink md:hidden">✕</button>
+          </div>
+          {/* Search (desktop) — filter/jump to a section */}
+          <div className="hidden px-3 pb-2 md:block">
+            <input
+              value={tabSearch}
+              onChange={(e) => setTabSearch(e.target.value)}
+              placeholder="Search settings…"
+              className="w-full rounded-lg border border-line bg-bg px-3 py-1.5 text-sm outline-none focus:border-accent"
+            />
+          </div>
+          <nav className="flex gap-1 overflow-x-auto px-2 pb-2 md:min-h-0 md:flex-col md:gap-0.5 md:overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {(() => {
+              const q = tabSearch.trim().toLowerCase();
+              const shown = SETTINGS_TABS.filter(
+                (t) => !q || t.label.toLowerCase().includes(q) || t.keywords.includes(q)
+              );
+              return shown.map((t, i) => {
+                const showGroup = !q && (i === 0 || shown[i - 1].group !== t.group);
+                return (
+                  <div key={t.id} className="contents">
+                    {showGroup && (
+                      <div className="mt-2 hidden px-3 pb-1 text-[11px] font-medium uppercase tracking-wide text-ink-muted first:mt-0 md:block">
+                        {t.group}
+                      </div>
+                    )}
+                    <button
+                      onClick={() => setTab(t.id)}
+                      className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg px-3 py-2 text-sm md:w-full ${
+                        tab === t.id
+                          ? "bg-surface-2 font-medium text-ink"
+                          : "text-ink-muted hover:bg-surface-2/60 hover:text-ink"
+                      }`}
+                    >
+                      <Icon name={t.icon} size={15} /> {t.label}
+                    </button>
+                  </div>
+                );
+              });
+            })()}
+          </nav>
         </div>
 
-        <div className="flex gap-1 overflow-x-auto border-b border-line px-5 pt-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-          {(
-            [
-              ["general", "General"],
-              ["personalization", "Personal"],
-              ["providers", "Providers"],
-              ["connectors", "Connectors"],
-              ["skills", "Skills"],
-              ["prompts", "Prompts"],
-              ["keys", "Keys"],
-              ["admin", "Admin"],
-            ] as const
-          ).map(([t, label]) => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={`shrink-0 whitespace-nowrap rounded-t-lg px-2.5 py-1.5 text-sm ${
-                tab === t
-                  ? "border border-b-0 border-line bg-surface font-medium"
-                  : "text-ink-muted hover:text-ink"
-              }`}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-y-auto p-5">
+        {/* Content pane */}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <button
+            onClick={onClose}
+            title="Close"
+            className="absolute right-4 top-4 z-10 hidden text-ink-muted hover:text-ink md:block"
+          >
+            ✕
+          </button>
+          <div className="min-h-0 flex-1 overflow-y-auto p-5">
           {tab === "general" ? (
             <div className="space-y-5">
               <Field
@@ -247,7 +309,7 @@ export default function SettingsDialog({
 
               <Field
                 label="Planner model (optional)"
-                hint="Cheap model that plans 🤖 Agent and 🔬 Research runs. Blank = use the chat's model."
+                hint="Cheap model that plans 🤖 Agent and 🔬 Research runs, and powers the “Draft with AI” helpers (Skills, Design systems). Blank = title model for drafting, the chat's model elsewhere."
               >
                 <ModelSelect models={models} value={plannerModel} onChange={setPlannerModel} />
               </Field>
@@ -397,6 +459,22 @@ export default function SettingsDialog({
                 </p>
               </div>
 
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium">
+                  <input
+                    type="checkbox"
+                    checked={recallEnabled}
+                    onChange={(e) => setRecallEnabled(e.target.checked)}
+                    className="accent-(--color-accent)"
+                  />
+                  Search past chats
+                </label>
+                <p className="mt-1 text-xs text-ink-muted">
+                  When on, the assistant can search your own previous conversations to
+                  recall earlier context or facts about you (e.g. &ldquo;who am I?&rdquo;).
+                </p>
+              </div>
+
               <PushToggle />
 
               <div className="divide-y divide-line rounded-lg border border-line">
@@ -481,9 +559,11 @@ export default function SettingsDialog({
           ) : tab === "connectors" ? (
             <ConnectorsTab />
           ) : tab === "skills" ? (
-            <SkillsTab />
+            <SkillsTab models={models} />
           ) : tab === "prompts" ? (
             <PromptsTab />
+          ) : tab === "design-systems" ? (
+            <DesignSystemsTab models={models} />
           ) : (
             <div className="space-y-4">
               <p className="text-sm text-ink-muted">
@@ -567,6 +647,7 @@ export default function SettingsDialog({
           >
             {saving ? "Saving…" : "Save"}
           </button>
+        </div>
         </div>
       </div>
     </div>
@@ -662,7 +743,7 @@ function AdminTab() {
 
 interface ProviderRow {
   id: string;
-  kind: "azure" | "bedrock" | "google" | "custom";
+  kind: "openai" | "anthropic" | "azure" | "bedrock" | "google" | "custom";
   name: string;
   enabled: number;
   endpoint: string | null;
@@ -672,6 +753,8 @@ interface ProviderRow {
 }
 
 const PROVIDER_KINDS = [
+  ["openai", "OpenAI (direct)"],
+  ["anthropic", "Anthropic (direct)"],
   ["azure", "Azure AI Foundry"],
   ["bedrock", "AWS Bedrock"],
   ["google", "Google (Gemini / Vertex)"],
@@ -750,7 +833,11 @@ function ProvidersTab() {
         ? "Model ids (e.g. anthropic.claude-sonnet-4-20250514-v1:0)"
         : kind === "google"
           ? "Model names (e.g. gemini-2.5-pro, gemini-3.1-flash)"
-          : "Model names your endpoint serves";
+          : kind === "openai"
+            ? "Model names (e.g. gpt-4o, gpt-4o-mini, o3-mini)"
+            : kind === "anthropic"
+              ? "Model names (e.g. claude-opus-4-20250514, claude-sonnet-4-20250514)"
+              : "Model names your endpoint serves";
 
   return (
     <div className="space-y-4">
@@ -761,7 +848,7 @@ function ProvidersTab() {
       </p>
 
       <div className="space-y-2 rounded-xl border border-line p-3">
-        <div className="flex gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row">
           <select
             value={kind}
             onChange={(e) => setKind(e.target.value as ProviderRow["kind"])}
@@ -794,13 +881,13 @@ function ProvidersTab() {
             className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent"
           />
         )}
-        <div className="flex gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row">
           {kind === "bedrock" && (
             <input
               value={region}
               onChange={(e) => setRegion(e.target.value)}
               placeholder="Region (us-east-1)"
-              className="w-40 rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent"
+              className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent sm:w-40"
             />
           )}
           {kind === "azure" && (
@@ -808,7 +895,7 @@ function ProvidersTab() {
               value={apiVersion}
               onChange={(e) => setApiVersion(e.target.value)}
               placeholder="api-version (blank = 2024-10-21)"
-              className="w-56 rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent"
+              className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent sm:w-56"
             />
           )}
           <input
@@ -825,7 +912,7 @@ function ProvidersTab() {
               Or use IAM credentials (access key + secret, signed with SigV4) — most AWS
               accounts. These take precedence over a Bedrock API key.
             </p>
-            <div className="flex gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row">
               <input
                 value={accessKeyId}
                 onChange={(e) => setAccessKeyId(e.target.value)}
@@ -856,7 +943,7 @@ function ProvidersTab() {
           placeholder={placeholderModels}
           className="w-full resize-y rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent"
         />
-        <div className="flex items-center gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
           <input
             value={promptPrice}
             onChange={(e) => setPromptPrice(e.target.value)}
@@ -1166,7 +1253,7 @@ function ConnectorsTab() {
         </button>
         {showAdd && (
           <div className="space-y-2 border-t border-line p-3">
-            <div className="flex gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row">
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
@@ -1185,12 +1272,12 @@ function ConnectorsTab() {
               </select>
             </div>
             {transport === "stdio" ? (
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <input
                   value={command}
                   onChange={(e) => setCommand(e.target.value)}
                   placeholder="Command (e.g. npx)"
-                  className="w-40 rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent"
+                  className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent sm:w-40"
                 />
                 <input
                   value={args}
@@ -1200,7 +1287,7 @@ function ConnectorsTab() {
                 />
               </div>
             ) : (
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <input
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
@@ -1212,7 +1299,7 @@ function ConnectorsTab() {
                   onChange={(e) => setBearerToken(e.target.value)}
                   type="password"
                   placeholder="Bearer token (optional)"
-                  className="w-52 rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent"
+                  className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent sm:w-52"
                 />
               </div>
             )}
@@ -1510,7 +1597,459 @@ interface SkillConnLite {
   tools: { name: string; description: string }[];
 }
 
-function SkillsTab() {
+interface DesignSystemRow {
+  id: string;
+  user_id: string;
+  name: string;
+  spec: string;
+  palette: string | null;
+  is_default: number;
+  shared?: boolean;
+  owner_name?: string;
+  sharedWith: { user_id: string; email: string; name: string }[];
+}
+
+function dsSwatches(palette: string | null): string[] {
+  try {
+    const arr = palette ? JSON.parse(palette) : [];
+    return Array.isArray(arr) ? arr.slice(0, 6) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Design systems: create (describe → AI drafts the spec), edit/remix, set a
+ * default, share with other Liberde users by email. Applied from the Design
+ * workspace's picker chip.
+ */
+function DesignSystemsTab({ models }: { models: ModelInfo[] }) {
+  const [systems, setSystems] = useState<DesignSystemRow[]>([]);
+  const [editing, setEditing] = useState<DesignSystemRow | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+  const [spec, setSpec] = useState("");
+  const [palette, setPalette] = useState<string | null>(null);
+  const [describe, setDescribe] = useState("");
+  const [draftImages, setDraftImages] = useState<{ name: string; dataUrl: string }[]>([]);
+  const [draftModel, setDraftModel] = useState("");
+  const [drafting, setDrafting] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [shareEmails, setShareEmails] = useState<Record<string, string>>({});
+  const [shareBusyId, setShareBusyId] = useState<string | null>(null);
+
+  const load = () =>
+    api<DesignSystemRow[]>("/api/design-systems").then(setSystems).catch(() => {});
+  useEffect(() => {
+    load();
+  }, []);
+
+  const startCreate = () => {
+    setCreating(true);
+    setEditing(null);
+    setName("");
+    setSpec("");
+    setPalette(null);
+    setDescribe("");
+    setError(null);
+  };
+  const startEdit = (s: DesignSystemRow) => {
+    setEditing(s);
+    setCreating(false);
+    setName(s.name);
+    setSpec(s.spec);
+    setPalette(s.palette);
+    setDescribe("");
+    setError(null);
+  };
+  const closeForm = () => {
+    setCreating(false);
+    setEditing(null);
+  };
+
+  const addImages = async (files: FileList | null) => {
+    if (!files) return;
+    const next = [...draftImages];
+    for (const f of Array.from(files).slice(0, 4 - next.length)) {
+      if (!f.type.startsWith("image/")) continue;
+      try {
+        const att = await fileToUploadAttachment(f);
+        if (att.dataUrl) next.push({ name: f.name, dataUrl: att.dataUrl });
+      } catch {
+        /* skip unreadable file */
+      }
+    }
+    setDraftImages(next.slice(0, 4));
+  };
+
+  // Describe and/or screenshots → AI drafts (create); instruction + current
+  // spec → AI remixes. Optional model override for vision extraction.
+  const draft = async () => {
+    if (!describe.trim() && draftImages.length === 0) return;
+    setDrafting(true);
+    setError(null);
+    try {
+      const res = await api<{ name: string; spec: string; palette: string }>(
+        "/api/design-systems/draft",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            prompt: describe,
+            ...(spec.trim() ? { current: spec, name } : {}),
+            ...(draftImages.length
+              ? { images: draftImages.map((d) => d.dataUrl) }
+              : {}),
+            ...(draftModel ? { model: draftModel } : {}),
+          }),
+        }
+      );
+      if (res.name && !name.trim()) setName(res.name);
+      else if (res.name && !spec.trim()) setName(res.name);
+      setSpec(res.spec);
+      setPalette(res.palette);
+      setDescribe("");
+    } catch (e) {
+      setError(String((e as Error).message || e));
+    } finally {
+      setDrafting(false);
+    }
+  };
+
+  const save = async () => {
+    if (!name.trim() || !spec.trim()) {
+      setError("Name and spec are both required — use Draft with AI or write the spec.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      if (editing) {
+        await api("/api/design-systems", {
+          method: "PATCH",
+          body: JSON.stringify({ id: editing.id, name, spec, palette }),
+        });
+      } else {
+        await api("/api/design-systems", {
+          method: "POST",
+          body: JSON.stringify({ name, spec, palette, isDefault: systems.length === 0 }),
+        });
+      }
+      closeForm();
+      await load();
+    } catch (e) {
+      setError(String((e as Error).message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setDefault = async (s: DesignSystemRow, on: boolean) => {
+    await api("/api/design-systems", {
+      method: "PATCH",
+      body: JSON.stringify({ id: s.id, isDefault: on }),
+    }).catch(() => {});
+    load();
+  };
+
+  const remove = async (s: DesignSystemRow) => {
+    if (!(await confirmDialog(`Delete design system "${s.name}"?`))) return;
+    await api(`/api/design-systems?id=${s.id}`, { method: "DELETE" }).catch(() => {});
+    if (editing?.id === s.id) closeForm();
+    load();
+  };
+
+  const share = async (s: DesignSystemRow) => {
+    const email = (shareEmails[s.id] ?? "").trim();
+    if (!email) return;
+    setShareBusyId(s.id);
+    setError(null);
+    try {
+      await api("/api/design-systems/share", {
+        method: "POST",
+        body: JSON.stringify({ id: s.id, email }),
+      });
+      setShareEmails((m) => ({ ...m, [s.id]: "" }));
+      await load();
+    } catch (e) {
+      setError(String((e as Error).message || e));
+    } finally {
+      setShareBusyId(null);
+    }
+  };
+
+  const unshare = async (s: DesignSystemRow, userId: string) => {
+    await api("/api/design-systems/share", {
+      method: "DELETE",
+      body: JSON.stringify({ id: s.id, userId }),
+    }).catch(() => {});
+    load();
+  };
+
+  const formOpen = creating || editing;
+
+  return (
+    <div className="space-y-4">
+      {/* pr-10 keeps the button clear of the dialog's ✕ close control. */}
+      <div className="flex items-center justify-between gap-2 pr-10">
+        <p className="text-sm text-ink-muted">
+          Reusable brand specs — colors, fonts, spacing, components. Pick one in the
+          Design workspace and every design follows it.
+        </p>
+        {!formOpen && (
+          <button
+            onClick={startCreate}
+            className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent-hover"
+          >
+            + New
+          </button>
+        )}
+      </div>
+      {error && <p className="text-xs text-red-600 dark:text-red-400">{error}</p>}
+
+      {formOpen && (
+        <div className="space-y-2.5 rounded-xl border border-line p-3">
+          <div className="flex items-center justify-between">
+            <p className="text-sm font-medium">
+              {editing ? `Edit ${editing.name}` : "New design system"}
+            </p>
+            <button onClick={closeForm} className="text-xs text-ink-muted hover:text-ink">
+              Cancel
+            </button>
+          </div>
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Name (e.g. MyBrand, Acme Deck)"
+            className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent"
+          />
+          <div className="flex gap-2">
+            <input
+              value={describe}
+              onChange={(e) => setDescribe(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && draft()}
+              placeholder={
+                spec.trim()
+                  ? "Remix: e.g. make the primary a deeper blue, swap to a serif"
+                  : "Describe the brand: e.g. warm minimal SaaS, terracotta + cream, friendly"
+              }
+              className="min-w-0 flex-1 rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-accent"
+            />
+            <button
+              onClick={draft}
+              disabled={(!describe.trim() && draftImages.length === 0) || drafting}
+              className="flex shrink-0 items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-40"
+            >
+              <Icon
+                name={drafting ? "refresh" : "sparkles"}
+                size={13}
+                className={drafting ? "animate-spin" : ""}
+              />
+              {drafting ? "Drafting…" : spec.trim() ? "Remix with AI" : "Draft with AI"}
+            </button>
+          </div>
+          {/* Extract from screenshots/brand assets — like Claude Design's import. */}
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-dashed border-line px-2.5 py-1.5 text-xs text-ink-muted hover:border-accent hover:text-ink">
+              <Icon name="image" size={13} />
+              {draftImages.length ? "Add more" : "Attach screenshots / brand assets"}
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  addImages(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+            {draftImages.map((img, i) => (
+              <span key={i} className="relative inline-block">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={img.dataUrl}
+                  alt={img.name}
+                  title={img.name}
+                  className="h-10 w-10 rounded-lg border border-line object-cover"
+                />
+                <button
+                  onClick={() =>
+                    setDraftImages((arr) => arr.filter((_, j) => j !== i))
+                  }
+                  className="absolute -right-1.5 -top-1.5 grid h-4 w-4 place-items-center rounded-full bg-surface-2 text-[9px] text-ink-muted shadow hover:text-ink"
+                  aria-label={`Remove ${img.name}`}
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+            <label className="flex items-center gap-1.5 text-[11px] text-ink-muted">
+              Draft model
+              <select
+                value={draftModel}
+                onChange={(e) => setDraftModel(e.target.value)}
+                title={
+                  draftImages.length
+                    ? "Screenshots need a model that understands images"
+                    : "Which model writes the spec. Auto = your planner model, falling back to title, then default."
+                }
+                className="rounded-lg border border-line bg-bg px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
+              >
+                <option value="">Auto (planner → title → default)</option>
+                {models
+                  // Screenshots require vision; text-only drafting can use anything.
+                  .filter((m) => (draftImages.length ? m.supportsImages : true))
+                  .slice(0, 60)
+                  .map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+          </div>
+          {draftImages.length > 0 && draftModel && !models.find((m) => m.id === draftModel)?.supportsImages && (
+            <p className="text-[11px] text-amber-600 dark:text-amber-400">
+              That model can&apos;t read images — pick a vision model for screenshot
+              extraction.
+            </p>
+          )}
+          {dsSwatches(palette).length > 0 && (
+            <div className="flex items-center gap-1.5">
+              {dsSwatches(palette).map((c, i) => (
+                <span
+                  key={i}
+                  title={c}
+                  className="h-5 w-5 rounded-full border border-black/10 dark:border-white/20"
+                  style={{ background: c }}
+                />
+              ))}
+            </div>
+          )}
+          <textarea
+            value={spec}
+            onChange={(e) => setSpec(e.target.value)}
+            rows={10}
+            placeholder="The spec (markdown): palette, typography, spacing, components, voice. Draft with AI fills this in."
+            className="w-full resize-y rounded-lg border border-line bg-bg px-3 py-2 font-mono text-xs outline-none focus:border-accent"
+          />
+          <button
+            onClick={save}
+            disabled={busy}
+            className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-40"
+          >
+            {busy ? "Saving…" : editing ? "Save changes" : "Create design system"}
+          </button>
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {systems.map((s) => (
+          <div key={s.id} className="rounded-xl border border-line p-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="flex min-w-0 items-center gap-2">
+                <span className="inline-flex shrink-0">
+                  {dsSwatches(s.palette).map((c, i) => (
+                    <span
+                      key={i}
+                      className="h-3.5 w-3.5 rounded-full border border-black/10 dark:border-white/20"
+                      style={{ background: c, marginLeft: i === 0 ? 0 : -5 }}
+                    />
+                  ))}
+                </span>
+                <span className="truncate text-sm font-medium">{s.name}</span>
+                {s.shared ? (
+                  <span className="shrink-0 rounded-full bg-surface-2 px-2 py-0.5 text-[11px] text-ink-muted">
+                    shared by {s.owner_name ?? "a teammate"}
+                  </span>
+                ) : s.is_default ? (
+                  <span className="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 text-[11px] text-accent">
+                    default
+                  </span>
+                ) : null}
+              </span>
+              <span className="flex shrink-0 items-center gap-2 text-xs">
+                {!s.shared && (
+                  <>
+                    <button
+                      onClick={() => setDefault(s, !s.is_default)}
+                      title={s.is_default ? "Unset default" : "Use for every new design"}
+                      className="text-ink-muted hover:text-ink"
+                    >
+                      {s.is_default ? "★" : "☆"}
+                    </button>
+                    <button
+                      onClick={() => startEdit(s)}
+                      className="text-ink-muted hover:text-ink"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => remove(s)}
+                      className="text-ink-muted hover:text-red-500"
+                    >
+                      Delete
+                    </button>
+                  </>
+                )}
+              </span>
+            </div>
+            {!s.shared && (
+              <div className="mt-2 border-t border-line pt-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-ink-muted">Shared with:</span>
+                  {s.sharedWith.length === 0 && (
+                    <span className="text-[11px] text-ink-muted">nobody yet</span>
+                  )}
+                  {s.sharedWith.map((m) => (
+                    <span
+                      key={m.user_id}
+                      className="flex items-center gap-1 rounded-full bg-surface-2 px-2 py-0.5 text-[11px]"
+                    >
+                      {m.name || m.email}
+                      <button
+                        onClick={() => unshare(s, m.user_id)}
+                        className="text-ink-muted hover:text-ink"
+                        aria-label={`Stop sharing with ${m.email}`}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  ))}
+                  <input
+                    value={shareEmails[s.id] ?? ""}
+                    onChange={(e) =>
+                      setShareEmails((m) => ({ ...m, [s.id]: e.target.value }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && share(s)}
+                    placeholder="teammate@email.com"
+                    className="w-44 rounded-lg border border-line bg-bg px-2 py-1 text-[11px] outline-none focus:border-accent"
+                  />
+                  <button
+                    onClick={() => share(s)}
+                    disabled={!(shareEmails[s.id] ?? "").trim() || shareBusyId === s.id}
+                    className="rounded-lg border border-line px-2 py-1 text-[11px] hover:bg-surface-2 disabled:opacity-40"
+                  >
+                    Share
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+        {systems.length === 0 && !formOpen && (
+          <p className="rounded-xl border border-dashed border-line p-6 text-center text-sm text-ink-muted">
+            No design systems yet. Create one and every design you build will stay on
+            brand.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SkillsTab({ models }: { models: ModelInfo[] }) {
   const [skills, setSkills] = useState<SkillRow[]>([]);
   const [conns, setConns] = useState<SkillConnLite[]>([]);
   const [editId, setEditId] = useState<string | null>(null);
@@ -1519,6 +2058,7 @@ function SkillsTab() {
   const [instructions, setInstructions] = useState("");
   const [connectorIds, setConnectorIds] = useState<string[]>([]);
   const [idea, setIdea] = useState("");
+  const [draftModel, setDraftModel] = useState("");
   const [drafting, setDrafting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -1557,7 +2097,10 @@ function SkillsTab() {
         description: string;
         instructions: string;
         connectorIds: string[];
-      }>("/api/skills/draft", { method: "POST", body: JSON.stringify({ prompt: idea }) });
+      }>("/api/skills/draft", {
+        method: "POST",
+        body: JSON.stringify({ prompt: idea, ...(draftModel ? { model: draftModel } : {}) }),
+      });
       setName(d.name);
       setDescription(d.description);
       setInstructions(d.instructions);
@@ -1658,14 +2201,32 @@ function SkillsTab() {
             placeholder="e.g. Research a company using DeepWiki and Microsoft Learn, then write a one-page brief"
             className="w-full resize-y rounded-lg border border-line bg-surface px-3 py-2 text-sm outline-none focus:border-accent"
           />
-          <button
-            onClick={draft}
-            disabled={!idea.trim() || drafting}
-            className="mt-1.5 flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-surface-2 disabled:opacity-40"
-          >
-            <Icon name={drafting ? "refresh" : "sparkles"} size={14} className={drafting ? "animate-spin" : ""} />
-            {drafting ? "Drafting…" : "Draft skill"}
-          </button>
+          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+            <button
+              onClick={draft}
+              disabled={!idea.trim() || drafting}
+              className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-surface-2 disabled:opacity-40"
+            >
+              <Icon name={drafting ? "refresh" : "sparkles"} size={14} className={drafting ? "animate-spin" : ""} />
+              {drafting ? "Drafting…" : "Draft skill"}
+            </button>
+            <label className="flex items-center gap-1.5 text-[11px] text-ink-muted">
+              Draft model
+              <select
+                value={draftModel}
+                onChange={(e) => setDraftModel(e.target.value)}
+                title="Which model writes the skill. Auto = your planner model, falling back to title, then default."
+                className="rounded-lg border border-line bg-bg px-2 py-1.5 text-xs text-ink outline-none focus:border-accent"
+              >
+                <option value="">Auto (planner → title → default)</option>
+                {models.slice(0, 60).map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
         </div>
 
         {/* Editable fields */}
@@ -1897,6 +2458,40 @@ function PushToggle() {
         setPublicKey(info.publicKey ?? null);
         const reg = await navigator.serviceWorker.ready;
         const sub = await reg.pushManager.getSubscription();
+        if (sub && info.publicKey && !subMatchesKey(sub, info.publicKey)) {
+          // Bound to a previous server key (keys were rotated) — sends can
+          // never reach this subscription. Re-subscribe under the new key.
+          try {
+            await sub.unsubscribe();
+            if (Notification.permission === "granted") {
+              const fresh = await reg.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: urlB64ToUint8Array(info.publicKey) as BufferSource,
+              });
+              await fetch("/api/push", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(fresh.toJSON()),
+              });
+              setOn(true);
+              setNote("Notifications were re-registered on this device (server keys had changed).");
+              return;
+            }
+          } catch {
+            /* fall through to off */
+          }
+          setOn(false);
+          setNote("Notifications needed re-enabling after a server update — flip the toggle back on.");
+          return;
+        }
+        if (sub) {
+          // Make sure the server still has this device on file (idempotent).
+          fetch("/api/push", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(sub.toJSON()),
+          }).catch(() => {});
+        }
         setOn(Boolean(sub));
       })
       .catch(() => {});
@@ -1913,6 +2508,12 @@ function PushToggle() {
         if (permission !== "granted") {
           setNote("Notifications are blocked for this site in your browser settings.");
           return;
+        }
+        // subscribe() throws InvalidStateError if a subscription under a
+        // different (old) key still exists — clear it first.
+        const existing = await reg.pushManager.getSubscription();
+        if (existing && !subMatchesKey(existing, publicKey)) {
+          await existing.unsubscribe().catch(() => {});
         }
         const sub = await reg.pushManager.subscribe({
           userVisibleOnly: true,
@@ -1956,10 +2557,45 @@ function PushToggle() {
       </label>
       <p className="mt-1 text-xs text-ink-muted">
         {serverEnabled
-          ? "Get notified on this device when an agent run or scheduled task finishes."
+          ? "Get notified on this device when a Plan or scheduled task finishes."
           : "Not configured on this server (VAPID keys missing)."}
       </p>
+      {on && serverEnabled && (
+        <button
+          onClick={async () => {
+            setNote(null);
+            try {
+              await fetch("/api/push", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "test" }),
+              });
+              setNote("Test sent — you should see a notification within a few seconds.");
+            } catch {
+              setNote("Couldn't send the test — try again.");
+            }
+          }}
+          className="mt-1.5 rounded-lg border border-line px-2.5 py-1 text-xs text-ink-muted hover:bg-surface-2 hover:text-ink"
+        >
+          Send test notification
+        </button>
+      )}
       {note && <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">{note}</p>}
     </div>
   );
+}
+
+/** True when an existing browser subscription was created with `key`. */
+function subMatchesKey(sub: PushSubscription, key: string): boolean {
+  try {
+    const current = sub.options?.applicationServerKey;
+    if (!current) return true; // can't tell — assume fine rather than churn
+    const a = new Uint8Array(current);
+    const b = urlB64ToUint8Array(key);
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  } catch {
+    return true;
+  }
 }
