@@ -14,8 +14,9 @@ and 400+ other models.
 | **CLI** | `apps/cli` | Zero-dependency terminal chat client (`liberde`) |
 | **Mobile** | PWA | Install from the browser ("Add to Home Screen") |
 
-Everything is a client of the one Next.js server. Data lives in `data/liberde.db`
-(SQLite, created on first run) — no external services required.
+Everything is a client of the one Next.js server. Data lives in **Postgres**
+(a [Neon](https://neon.tech) serverless database works well) — set `DATABASE_URL`
+in `.env.local`. The schema is created and migrated automatically on first run.
 
 ## Multi-user
 
@@ -28,35 +29,39 @@ chats, projects, memory, skills, connectors, scheduled tasks, and platform API
 keys. Platform API keys resolve to their owner, and the task scheduler runs each
 task as its owner. Shared artifact/chat links stay public by design.
 
-**Team features**: project owners can share a project with other users by email
-(Project page → 👥 Shared with). Members see the project in their sidebar, chat
-with its instructions and knowledge files, but keep their own private chats;
-only owners edit the project. Admins get a **Settings → Admin** tab: user list,
-promote/demote admins, delete users (with all their data), and an
-allow-signups toggle.
-
-**Postgres/Vercel migration path** (deliberate design choices):
-- All data access lives in `lib/db.ts` — port one file to swap SQLite for Neon
-  (the SQL is portable except the PRAGMA and `ensureColumn` migrations)
+**Serverless / Vercel design choices:**
+- All data access lives in `lib/db.ts` (Postgres via the `@neondatabase/serverless`
+  driver); the schema is defined + migrated idempotently at startup
 - Sessions are DB-backed opaque tokens (no in-process state), auth in
   `lib/auth.ts`
-- Every user-owned row carries `user_id`; the only SQLite-specific runtime
-  dependency is `better-sqlite3` itself
-- The in-process scheduler and MCP connection cache assume a long-lived Node
-  process — on serverless, move the scheduler to Vercel Cron and expect MCP
-  stdio connectors to become remote-HTTP-only
+- Every user-owned row carries `user_id` for full multi-user isolation
+- Scheduled tasks run via **Vercel Cron** (`/api/cron`, secured by `CRON_SECRET`),
+  not an in-process timer; **Fluid Compute** + `waitUntil` let agent runs finish
+  after the response is sent; MCP connectors are remote-HTTP (stdio needs a
+  long-lived process, unavailable on serverless)
 
 ## Quick start
 
 ```bash
 npm install
+# Set your Postgres connection string (a free Neon database works great):
+echo "DATABASE_URL=postgresql://USER:PASSWORD@HOST/DB?sslmode=require" > .env.local
 npm run build
 npm start          # http://localhost:3000
 ```
 
-On first launch the Settings dialog opens — paste an OpenRouter API key
-(from https://openrouter.ai/keys). Alternatively put it in `.env.local`
-as `OPENROUTER_API_KEY=` (see `.env.local.example`).
+The schema is created automatically on first run. On first launch the Settings
+dialog opens — paste an OpenRouter API key (from https://openrouter.ai/keys).
+For a **single-user local** install you may instead set `OPENROUTER_API_KEY=` in
+`.env.local`; note this shared fallback is **deliberately ignored on any
+multi-user or public deploy** (Vercel, or `REQUIRE_AUTH=1`) — there, every user
+brings their own key so no one can spend another's. For web push, set
+`VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY` (`npx web-push generate-vapid-keys`); for
+scheduled tasks on Vercel, set `CRON_SECRET` and the cron in `vercel.json`.
+
+> **Public deploys:** set `REQUIRE_AUTH=1` (auto-on for Vercel) so login is
+> enforced. Vercel BotID guards signup/login; keep signups closed in Admin until
+> you're ready to open them.
 
 For development: `npm run dev`.
 
@@ -65,10 +70,13 @@ For development: `npm run dev`.
 - **Streaming chat** with stop, regenerate, and edit-and-resend
 - **Any OpenRouter model**, searchable picker with pricing and context size;
   switch models mid-conversation
-- **Bring your own clouds** (Settings → Providers) — add **Azure AI Foundry**
-  deployments, **AWS Bedrock** models (via Bedrock API keys), **Google
-  Gemini/Vertex**, or any **custom OpenAI-compatible endpoint** (Groq, Ollama,
-  vLLM…). Their models appear in the picker as “Provider · model”, route
+- **Second opinion** — run the same question through 2–4 models side by side
+  (streaming columns, per-model cost/tokens), then swap the reply you prefer
+  into the thread; the original is kept as a switchable branch
+- **Bring your own clouds** (Settings → Providers) — add **OpenAI (direct)**,
+  **Anthropic (direct)**, **Azure AI Foundry** deployments, **AWS Bedrock**
+  models (via Bedrock API keys), **Google Gemini/Vertex**, or any **custom
+  OpenAI-compatible endpoint** (Groq, Ollama, vLLM…). Their models appear in the picker as “Provider · model”, route
   directly to that cloud with your credentials, work with the tool loop, and
   are per-user — with **full feature parity**: the 🌐 Search toggle injects
   Liberde-run web results, PDFs are text-extracted server-side (pdf-parse),
@@ -88,12 +96,13 @@ For development: `npm run dev`.
 - **Deep Research** (🔬 toggle) — plans search queries, runs parallel web
   searches, and streams a synthesized, citation-numbered report with a live
   progress trail
-- **Agent mode** (🤖 toggle) — plan-then-execute: breaks your goal into steps,
+- **Plan mode** (✦ toggle) — plan-then-execute: breaks your goal into steps,
   executes each with the full tool belt (web search, page reading, MCP
   connectors, skills), shows the live plan checklist, then streams a final
-  deliverable (often an artifact) with the executed plan recorded on it
+  deliverable (often an artifact) with the executed plan recorded on it —
+  resumable across serverless invocations if it runs long
 - **Voice conversations** (🎧 in the header) — hands-free loop: speak, hear the
-  reply read aloud, speak again (plus 🎤 dictation and 🔊 read-aloud per reply)
+  reply, speak again (plus 🎤 dictation)
 - **Editable artifacts** — ✏ edit any artifact yourself (saves as a new
   version), or select text and hit 💬 to ask for a targeted change
 - **Office exports** — slides → **.pptx** (PowerPoint-editable, best-effort
@@ -136,21 +145,42 @@ For development: `npm run dev`.
   id handle, so "actually I switched teams" updates the fact instead of
   duplicating it); non-tool models fall back to the `<liberdeMemory>` tag;
   view/delete everything in Settings → Personalization; never active in
-  temporary chats. Agent-mode runs share the same memory tools.
+  temporary chats. Plan-mode runs share the same memory tools.
+- **Recall** (Settings → Personal toggle) — the model can search your own past
+  conversations as a tool, so "what did we decide last week?" actually works
 - **Planner/executor model split** — optional Settings fields route agent &
   research *planning* and agent *step execution* to cheaper models while the
   final deliverable keeps your main model — big cost savings on long runs
 - **Personalization** — "about you" and "response style" custom instructions
-- **Voice** — 🎤 dictation (Web Speech API) and 🔊 read-aloud on any reply
+- **Web push notifications** — enable per device in Settings → Personal
+  (VAPID); get notified when a Plan finishes or a scheduled task completes
 - **Share chats** — publish an immutable public snapshot at `/share/<id>`
 - **Temporary chats** — hidden from history, no memory, auto-purged after 24h
 - **Full-text search** across chat titles *and* message content
 - **Cost tracking** — every reply records its real OpenRouter cost and tokens
   (including tool rounds, web searches, research pipelines, and image gen);
-  hover a reply for its cost, and the chat header shows the conversation total
+  hover a reply for its cost, and the chat header shows the conversation total.
+  Costs are **attributed by category** (model vs web search vs image) — the
+  Usage page's "Where it goes" section shows the split, and each reply's
+  tooltip shows its own breakdown
 - **Auto-titled conversations** (configurable cheap "title model")
 - **Projects** — group chats under shared custom instructions + knowledge files
 - **Artifacts** — first-class, versioned, publishable (see below)
+- **Design studio** — a separate workspace (Chat/Design switcher) for
+  interactive prototypes, slide decks, landing pages, and apps: it asks one
+  round of clarifying questions (clickable options), builds on a live canvas,
+  and supports element-select commenting, per-slide edits, live color/spacing
+  sliders, and AI-generated imagery
+- **Design systems** — save named brand specs (palette, typography, spacing,
+  components, voice) and pick one from the 🎨 chip so every design stays on
+  brand; create by describing the brand **or by attaching screenshots/brand
+  assets** (a vision model extracts real colors/fonts — model selectable),
+  "Remix with AI" to revise, one default, many systems per user
+- **User-to-user sharing** — share design systems *and* artifacts to another
+  Liberde user by email: systems appear in their picker (read-only), artifacts
+  land in their "Shared with you" sidebar view where **"Open & edit a copy"**
+  clones the artifact into their own Design conversation (the original is
+  untouched)
 - **Attachments** — paste images anywhere on the page (screenshots included),
   drag & drop files onto the window, or upload: images (auto-downscaled to
   ~1568px like Claude, thumbnail previews, vision-model warning), **PDFs**
@@ -230,7 +260,7 @@ Set `LIBERDE_URL` to point the shell at a remote Liberde server.
 
 ## Architecture notes
 
-- `lib/db.ts` — SQLite schema + data access (better-sqlite3, WAL mode)
+- `lib/db.ts` — Postgres schema + data access (@neondatabase/serverless)
 - `lib/openrouter.ts` — upstream client, model cache, prompt assembly
 - `app/api/chat/route.ts` — the streaming pipeline: persists the user turn,
   streams deltas as SSE, persists the assistant turn (also on client abort),
@@ -243,7 +273,11 @@ Set `LIBERDE_URL` to point the shell at a remote Liberde server.
 
 ## Security
 
-- The OpenRouter key is stored server-side (SQLite or env) and never sent to clients
+- The OpenRouter key is stored server-side (Postgres or env) and never sent to clients
 - Platform keys are shown once at creation; only hashes are stored
-- The web UI itself has no login — bind it to localhost or put it behind a
-  reverse proxy with auth if you expose it beyond your machine
+- Multi-user auth: DB-backed sessions (httpOnly, Secure cookies), bcrypt-hashed
+  passwords, per-user row isolation on every table; once the first account
+  exists, sign-in is required and signups can be closed from Admin
+- Public share links (`/share/<id>`, `/a/<id>`) are intentionally public;
+  user-to-user shares (projects, design systems, artifacts) resolve strictly by
+  account and are read-only for recipients

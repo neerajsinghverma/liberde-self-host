@@ -2,16 +2,50 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import { encryptSecret, decryptSecret } from "./crypto-secrets";
 import type {
   AgentRun,
   AgentStep,
   Attachment,
   Conversation,
   DesignSystem,
+  HttpTool,
+  HttpToolAuth,
+  HttpToolParam,
   Message,
   Project,
   ProjectFile,
 } from "./types";
+
+// ---- At-rest secret encryption (AES-256-GCM, key in env; see crypto-secrets) ----
+// Settings whose value is a secret and must be encrypted before it hits the DB.
+const SECRET_SETTING_KEYS = new Set(["openrouter_api_key"]);
+// Provider-config fields that hold secrets.
+const SECRET_CONFIG_FIELDS = ["apiKey", "secretAccessKey", "secretKey", "token"];
+
+/** Encrypt the secret fields inside a provider config JSON string. */
+function encProviderConfig(configStr: string): string {
+  try {
+    const c = JSON.parse(configStr) as Record<string, unknown>;
+    for (const f of SECRET_CONFIG_FIELDS)
+      if (typeof c[f] === "string" && c[f]) c[f] = encryptSecret(c[f] as string);
+    return JSON.stringify(c);
+  } catch {
+    return configStr;
+  }
+}
+/** Decrypt the secret fields inside a provider config JSON string. */
+function decProviderConfig(configStr: string | null): string | null {
+  if (!configStr) return configStr;
+  try {
+    const c = JSON.parse(configStr) as Record<string, unknown>;
+    for (const f of SECRET_CONFIG_FIELDS)
+      if (typeof c[f] === "string" && c[f]) c[f] = decryptSecret(c[f] as string);
+    return JSON.stringify(c);
+  } catch {
+    return configStr;
+  }
+}
 
 const DATA_DIR = path.join(process.cwd(), "data");
 
@@ -155,6 +189,28 @@ function createDb(): Database.Database {
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS http_tools (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL DEFAULT 'local',
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      method TEXT NOT NULL DEFAULT 'GET',
+      url_template TEXT NOT NULL,
+      params TEXT NOT NULL DEFAULT '[]',
+      headers TEXT NOT NULL DEFAULT '{}',
+      auth TEXT NOT NULL DEFAULT '{"type":"none"}',
+      auth_secret TEXT,
+      body_mode TEXT NOT NULL DEFAULT 'auto',
+      body_template TEXT,
+      response_extract TEXT,
+      max_response_bytes INTEGER NOT NULL DEFAULT 24576,
+      auto_run INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'manual',
+      openapi_group TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_http_tools_user ON http_tools(user_id);
     CREATE TABLE IF NOT EXISTS scheduled_tasks (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -222,6 +278,7 @@ function createDb(): Database.Database {
   ensureColumn(db, "connectors", "tools_cache", "TEXT");
   ensureColumn(db, "connectors", "last_tested", "INTEGER");
   ensureColumn(db, "skills", "connector_ids", "TEXT");
+  ensureColumn(db, "skills", "http_tool_ids", "TEXT");
   ensureColumn(db, "conversations", "locked_at", "INTEGER");
   ensureColumn(db, "conversations", "mode", "TEXT NOT NULL DEFAULT 'chat'");
   db.exec(`
@@ -296,6 +353,26 @@ function createDb(): Database.Database {
   ensureColumn(db, "conversations", "design_system_id", "TEXT");
   // Cost attribution: JSON {"model":n,"search":n,"image":n} per assistant turn.
   ensureColumn(db, "messages", "cost_breakdown", "TEXT");
+  // Wall-clock generation time per assistant turn (footer: cost · tok · ms).
+  ensureColumn(db, "messages", "duration_ms", "INTEGER");
+  // Auto routing: the reason the router picked this turn's model (footer badge).
+  ensureColumn(db, "messages", "route_reason", "TEXT");
+  // Email flows: hashed password-reset / verify tokens + per-user verified flag.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS auth_tokens (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+  `);
+  ensureColumn(db, "users", "email_verified", "INTEGER NOT NULL DEFAULT 0");
+  // Brute-force lockout: consecutive failed logins + a temporary lock timestamp.
+  ensureColumn(db, "users", "failed_logins", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "users", "locked_until", "INTEGER NOT NULL DEFAULT 0");
+  // Sign-in method: 'password' or 'google' (OAuth accounts have no password).
+  ensureColumn(db, "users", "auth_provider", "TEXT NOT NULL DEFAULT 'password'");
 
   // Indexes for per-user / per-parent lookups. All referenced tables + columns
   // exist by now; each guarded so one failure can't wedge startup.
@@ -315,12 +392,31 @@ function createDb(): Database.Database {
     "CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact ON artifact_versions(artifact_id)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due ON scheduled_tasks(enabled, next_run)",
+    // Both queried WHERE user_id but their PKs are endpoint/id.
+    "CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_user ON scheduled_tasks(user_id)",
   ]) {
     try {
       db.exec(stmt);
     } catch {
       /* non-fatal */
     }
+  }
+
+  // One-time grandfather: accounts predating email verification stay verified
+  // (guarded by a marker so future unverified signups are still gated).
+  try {
+    const done = db
+      .prepare("SELECT 1 FROM settings WHERE user_id = 'global' AND key = 'email_verify_backfill' LIMIT 1")
+      .get();
+    if (!done) {
+      db.exec("UPDATE users SET email_verified = 1");
+      db.prepare(
+        "INSERT OR IGNORE INTO settings (user_id, key, value) VALUES ('global', 'email_verify_backfill', '1')"
+      ).run();
+    }
+  } catch {
+    /* non-fatal */
   }
 
   // Temporary chats are ephemeral by contract: purge stale ones on boot.
@@ -389,19 +485,26 @@ export function getSetting(key: string, userId: string = DEFAULT_USER): string |
   const row = db
     .prepare("SELECT value FROM settings WHERE user_id = ? AND key = ?")
     .get(userId, key) as { value: string } | undefined;
-  return row?.value ?? null;
+  const val = row?.value ?? null;
+  return SECRET_SETTING_KEYS.has(key) ? decryptSecret(val) : val;
 }
 
 export function setSetting(key: string, value: string, userId: string = DEFAULT_USER) {
+  const toStore = SECRET_SETTING_KEYS.has(key) ? encryptSecret(value) : value;
   db.prepare(
     "INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value"
-  ).run(userId, key, value);
+  ).run(userId, key, toStore);
 }
 
 export function getApiKey(userId: string = DEFAULT_USER): string {
-  return (
-    getSetting("openrouter_api_key", userId) || process.env.OPENROUTER_API_KEY || ""
-  );
+  const own = getSetting("openrouter_api_key", userId);
+  if (own) return own;
+  // The shared OPENROUTER_API_KEY env fallback is allowed ONLY for a
+  // single-user/local install (no auth). Any multi-user or public deploy
+  // (Vercel, or REQUIRE_AUTH set) is strictly per-user — never let one user
+  // (or the operator's key) be spent by anyone else.
+  const multiUser = Boolean(process.env.REQUIRE_AUTH ?? process.env.VERCEL);
+  return multiUser ? "" : process.env.OPENROUTER_API_KEY || "";
 }
 
 // ---------- conversations ----------
@@ -709,6 +812,16 @@ export function listMessages(conversationId: string): Message[] {
   return rows.map(rowToMessage);
 }
 
+/** Concrete model of the most recent assistant turn — used for Auto stickiness. */
+export function getLastAssistantModel(conversationId: string): string | null {
+  const row = db
+    .prepare(
+      "SELECT model FROM messages WHERE conversation_id = ? AND role = 'assistant' AND model IS NOT NULL AND model <> 'auto' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    )
+    .get(conversationId) as { model?: string } | undefined;
+  return row?.model ?? null;
+}
+
 export function addMessage(
   conversationId: string,
   role: Message["role"],
@@ -726,6 +839,8 @@ export function addMessage(
     tokens_in?: number | null;
     tokens_out?: number | null;
     cost_breakdown?: string | null;
+    duration_ms?: number | null;
+    route_reason?: string | null;
   } = {}
 ): Message {
   const msg: Message = {
@@ -745,10 +860,12 @@ export function addMessage(
     tokens_in: extras.tokens_in ?? null,
     tokens_out: extras.tokens_out ?? null,
     cost_breakdown: extras.cost_breakdown ?? null,
+    duration_ms: extras.duration_ms ?? null,
+    route_reason: extras.route_reason ?? null,
     created_at: now(),
   };
   db.prepare(
-    "INSERT INTO messages (id, conversation_id, role, content, model, attachments, reasoning, annotations, images, tool_calls, tool_call_id, reasoning_ms, cost, tokens_in, tokens_out, cost_breakdown, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO messages (id, conversation_id, role, content, model, attachments, reasoning, annotations, images, tool_calls, tool_call_id, reasoning_ms, cost, tokens_in, tokens_out, cost_breakdown, duration_ms, route_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(
     msg.id,
     msg.conversation_id,
@@ -766,6 +883,8 @@ export function addMessage(
     msg.tokens_in,
     msg.tokens_out,
     msg.cost_breakdown,
+    msg.duration_ms,
+    msg.route_reason,
     msg.created_at
   );
   touchConversation(conversationId);
@@ -1373,8 +1492,14 @@ export function addProjectFile(projectId: string, name: string, content: string)
   return file;
 }
 
-export function deleteProjectFile(id: string) {
-  db.prepare("DELETE FROM project_files WHERE id = ?").run(id);
+export function deleteProjectFile(id: string, projectId?: string) {
+  // When projectId is given, scope the delete to it so a caller can't remove a
+  // file that belongs to a different (foreign) project.
+  if (projectId) {
+    db.prepare("DELETE FROM project_files WHERE id = ? AND project_id = ?").run(id, projectId);
+  } else {
+    db.prepare("DELETE FROM project_files WHERE id = ?").run(id);
+  }
 }
 
 // ---------- artifacts ----------
@@ -1649,15 +1774,17 @@ export interface ProviderRecord {
 }
 
 export function listProviders(userId: string = DEFAULT_USER): ProviderRecord[] {
-  return db
+  const rows = db
     .prepare("SELECT * FROM providers WHERE user_id = ? ORDER BY created_at ASC")
     .all(userId) as ProviderRecord[];
+  return rows.map((r) => ({ ...r, config: decProviderConfig(r.config) as string }));
 }
 
 export function getProvider(id: string): ProviderRecord | undefined {
-  return db.prepare("SELECT * FROM providers WHERE id = ?").get(id) as
+  const r = db.prepare("SELECT * FROM providers WHERE id = ?").get(id) as
     | ProviderRecord
     | undefined;
+  return r ? { ...r, config: decProviderConfig(r.config) as string } : undefined;
 }
 
 export function createProvider(
@@ -1675,7 +1802,7 @@ export function createProvider(
   };
   db.prepare(
     "INSERT INTO providers (id, user_id, kind, name, config, enabled, created_at) VALUES (@id, @user_id, @kind, @name, @config, @enabled, @created_at)"
-  ).run(record);
+  ).run({ ...record, config: encProviderConfig(record.config) });
   return record;
 }
 
@@ -1683,7 +1810,10 @@ export function updateProvider(id: string, fields: Partial<Pick<ProviderRecord, 
   const record = getProvider(id);
   if (!record) return;
   const merged = { ...record, ...fields };
-  db.prepare("UPDATE providers SET name=@name, config=@config, enabled=@enabled WHERE id=@id").run(merged);
+  db.prepare("UPDATE providers SET name=@name, config=@config, enabled=@enabled WHERE id=@id").run({
+    ...merged,
+    config: encProviderConfig(merged.config),
+  });
 }
 
 export function deleteProvider(id: string) {
@@ -1733,21 +1863,32 @@ export function getConnectorOAuth(id: string): Record<string, unknown> {
 export function saveConnectorOAuth(id: string, patch: Record<string, unknown>) {
   const merged = { ...getConnectorOAuth(id), ...patch };
   db.prepare("UPDATE connectors SET oauth_data = ? WHERE id = ?").run(
-    JSON.stringify(merged),
+    encryptSecret(JSON.stringify(merged)),
     id
   );
 }
 
+/** Decrypt a connector's secret-bearing columns (headers, oauth_data) for use. */
+function decConnector(c: Connector): Connector {
+  return {
+    ...c,
+    headers: decryptSecret(c.headers),
+    oauth_data: decryptSecret(c.oauth_data),
+  };
+}
+
 export function listConnectors(userId: string = DEFAULT_USER): Connector[] {
-  return db
+  const rows = db
     .prepare("SELECT * FROM connectors WHERE user_id = ? ORDER BY created_at ASC")
     .all(userId) as Connector[];
+  return rows.map(decConnector);
 }
 
 export function getConnector(id: string): Connector | undefined {
-  return db.prepare("SELECT * FROM connectors WHERE id = ?").get(id) as
+  const r = db.prepare("SELECT * FROM connectors WHERE id = ?").get(id) as
     | Connector
     | undefined;
+  return r ? decConnector(r) : undefined;
 }
 
 export function createConnector(
@@ -1778,7 +1919,7 @@ export function createConnector(
   };
   db.prepare(
     "INSERT INTO connectors (id, name, transport, command, args, url, headers, oauth_data, tools_cache, last_tested, enabled, user_id, created_at) VALUES (@id, @name, @transport, @command, @args, @url, @headers, @oauth_data, @tools_cache, @last_tested, @enabled, @user_id, @created_at)"
-  ).run(record);
+  ).run({ ...record, headers: encryptSecret(record.headers) });
   return record as Connector;
 }
 
@@ -1788,11 +1929,154 @@ export function updateConnector(id: string, fields: Partial<Connector>) {
   const merged = { ...record, ...fields };
   db.prepare(
     "UPDATE connectors SET name=@name, transport=@transport, command=@command, args=@args, url=@url, headers=@headers, enabled=@enabled WHERE id=@id"
-  ).run(merged);
+  ).run({ ...merged, headers: encryptSecret(merged.headers) });
 }
 
 export function deleteConnector(id: string) {
   db.prepare("DELETE FROM connectors WHERE id = ?").run(id);
+}
+
+// ---------- http tools (user-defined REST endpoints) ----------
+
+function rowToHttpTool(r: Record<string, unknown>): HttpTool & { auth_secret: string | null } {
+  const safeJson = <T,>(s: unknown, fallback: T): T => {
+    try {
+      return s ? (JSON.parse(s as string) as T) : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+  return {
+    id: r.id as string,
+    user_id: r.user_id as string,
+    name: r.name as string,
+    description: (r.description as string) ?? "",
+    method: (r.method as string) ?? "GET",
+    url_template: r.url_template as string,
+    params: safeJson<HttpToolParam[]>(r.params, []),
+    headers: safeJson<Record<string, string>>(r.headers, {}),
+    auth: safeJson<HttpToolAuth>(r.auth, { type: "none" }),
+    auth_secret: decryptSecret((r.auth_secret as string) ?? null),
+    body_mode: ((r.body_mode as string) ?? "auto") as "auto" | "template",
+    body_template: (r.body_template as string) ?? null,
+    response_extract: (r.response_extract as string) ?? null,
+    max_response_bytes: Number(r.max_response_bytes ?? 24576),
+    auto_run: Number(r.auto_run ?? 0),
+    source: ((r.source as string) ?? "manual") as "manual" | "openapi",
+    openapi_group: (r.openapi_group as string) ?? null,
+    enabled: Number(r.enabled ?? 1),
+    created_at: Number(r.created_at ?? 0),
+  };
+}
+
+export function redactHttpTool(t: HttpTool & { auth_secret?: string | null }): HttpTool {
+  const { auth_secret, ...rest } = t;
+  return { ...rest, auth: { ...rest.auth, hasSecret: Boolean(auth_secret) } };
+}
+
+export function listHttpTools(userId: string, withSecret = false): HttpTool[] {
+  const rows = db
+    .prepare("SELECT * FROM http_tools WHERE user_id = ? ORDER BY created_at DESC")
+    .all(userId) as Record<string, unknown>[];
+  return rows.map((r) => {
+    const t = rowToHttpTool(r);
+    return withSecret ? t : redactHttpTool(t);
+  });
+}
+
+export function getHttpTool(
+  id: string,
+  userId: string
+): (HttpTool & { auth_secret: string | null }) | undefined {
+  const row = db
+    .prepare("SELECT * FROM http_tools WHERE id = ? AND user_id = ?")
+    .get(id, userId) as Record<string, unknown> | undefined;
+  return row ? rowToHttpTool(row) : undefined;
+}
+
+export function getHttpToolByName(
+  userId: string,
+  name: string
+): (HttpTool & { auth_secret: string | null }) | undefined {
+  const row = db
+    .prepare("SELECT * FROM http_tools WHERE user_id = ? AND name = ? AND enabled = 1")
+    .get(userId, name) as Record<string, unknown> | undefined;
+  return row ? rowToHttpTool(row) : undefined;
+}
+
+export function createHttpTool(
+  userId: string,
+  t: Omit<HttpTool, "id" | "user_id" | "created_at"> & { auth_secret?: string | null }
+): HttpTool {
+  const id = newId();
+  const createdAt = Date.now();
+  db.prepare(
+    `INSERT INTO http_tools
+      (id, user_id, name, description, method, url_template, params, headers, auth, auth_secret,
+       body_mode, body_template, response_extract, max_response_bytes, auto_run, source, openapi_group, enabled, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    userId,
+    t.name,
+    t.description,
+    t.method,
+    t.url_template,
+    JSON.stringify(t.params ?? []),
+    JSON.stringify(t.headers ?? {}),
+    JSON.stringify(t.auth ?? { type: "none" }),
+    encryptSecret(t.auth_secret ?? null),
+    t.body_mode ?? "auto",
+    t.body_template ?? null,
+    t.response_extract ?? null,
+    t.max_response_bytes ?? 24576,
+    t.auto_run ?? 0,
+    t.source ?? "manual",
+    t.openapi_group ?? null,
+    t.enabled ?? 1,
+    createdAt
+  );
+  return { ...(t as HttpTool), id, user_id: userId, created_at: createdAt };
+}
+
+export function updateHttpTool(
+  id: string,
+  userId: string,
+  fields: Partial<HttpTool & { auth_secret: string | null }>
+) {
+  const cur = getHttpTool(id, userId);
+  if (!cur) return;
+  const m = { ...cur, ...fields };
+  db.prepare(
+    `UPDATE http_tools SET name=?, description=?, method=?, url_template=?, params=?, headers=?,
+       auth=?, auth_secret=?, body_mode=?, body_template=?, response_extract=?,
+       max_response_bytes=?, auto_run=?, enabled=? WHERE id=? AND user_id=?`
+  ).run(
+    m.name,
+    m.description,
+    m.method,
+    m.url_template,
+    JSON.stringify(m.params ?? []),
+    JSON.stringify(m.headers ?? {}),
+    JSON.stringify(m.auth ?? { type: "none" }),
+    encryptSecret(fields.auth_secret === undefined ? cur.auth_secret : fields.auth_secret),
+    m.body_mode,
+    m.body_template ?? null,
+    m.response_extract ?? null,
+    m.max_response_bytes,
+    m.auto_run,
+    m.enabled,
+    id,
+    userId
+  );
+}
+
+export function deleteHttpTool(id: string, userId: string) {
+  db.prepare("DELETE FROM http_tools WHERE id = ? AND user_id = ?").run(id, userId);
+}
+
+export function deleteHttpToolGroup(openapiGroup: string, userId: string) {
+  db.prepare("DELETE FROM http_tools WHERE openapi_group = ? AND user_id = ?").run(openapiGroup, userId);
 }
 
 // ---------- skills ----------
@@ -1803,7 +2087,9 @@ export interface SkillRecord {
   description: string;
   instructions: string;
   connector_ids: string | null; // JSON array of connector ids this skill bundles
+  http_tool_ids: string | null; // JSON array of http-tool ids this skill bundles
   enabled: number;
+  user_id: string;
   created_at: number;
 }
 
@@ -1825,6 +2111,7 @@ export function createSkill(
     description: string;
     instructions: string;
     connectorIds?: string[];
+    httpToolIds?: string[];
   },
   userId: string = DEFAULT_USER
 ): SkillRecord {
@@ -1834,12 +2121,13 @@ export function createSkill(
     description: input.description,
     instructions: input.instructions,
     connector_ids: input.connectorIds?.length ? JSON.stringify(input.connectorIds) : null,
+    http_tool_ids: input.httpToolIds?.length ? JSON.stringify(input.httpToolIds) : null,
     enabled: 1,
     user_id: userId,
     created_at: now(),
   };
   db.prepare(
-    "INSERT INTO skills (id, name, description, instructions, connector_ids, enabled, user_id, created_at) VALUES (@id, @name, @description, @instructions, @connector_ids, @enabled, @user_id, @created_at)"
+    "INSERT INTO skills (id, name, description, instructions, connector_ids, http_tool_ids, enabled, user_id, created_at) VALUES (@id, @name, @description, @instructions, @connector_ids, @http_tool_ids, @enabled, @user_id, @created_at)"
   ).run(record);
   return record as SkillRecord;
 }
@@ -1849,7 +2137,7 @@ export function updateSkill(id: string, fields: Partial<SkillRecord>) {
   if (!record) return;
   const merged = { ...record, ...fields };
   db.prepare(
-    "UPDATE skills SET name=@name, description=@description, instructions=@instructions, connector_ids=@connector_ids, enabled=@enabled WHERE id=@id"
+    "UPDATE skills SET name=@name, description=@description, instructions=@instructions, connector_ids=@connector_ids, http_tool_ids=@http_tool_ids, enabled=@enabled WHERE id=@id"
   ).run(merged);
 }
 

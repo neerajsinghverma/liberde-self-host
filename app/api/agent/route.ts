@@ -10,9 +10,8 @@ import {
   tryLockConversation,
   unlockConversation,
   updateConversation,
-  spendThisMonth,
 } from "@/lib/db";
-import { complete, getSettings, keyProblem } from "@/lib/openrouter";
+import { complete, getSettings, keyProblem, resolveAutoModel } from "@/lib/openrouter";
 import { runAgentSlice } from "@/lib/agent-runner";
 import type { AgentRun } from "@/lib/types";
 import { waitUntil } from "@vercel/functions";
@@ -68,14 +67,10 @@ export async function POST(req: NextRequest) {
   let settings, model, plannerModel, execModel;
   try {
     settings = await getSettings(userId);
-    if (settings.monthlyBudget > 0 && (await spendThisMonth(userId)) >= settings.monthlyBudget) {
-      await unlockConversation(conversation.id);
-      return Response.json(
-        { error: `Monthly budget of $${settings.monthlyBudget} reached. Raise it in Settings.` },
-        { status: 402 }
-      );
-    }
     model = body.model || conversation.model || settings.defaultModel;
+    // If the conversation is on Auto, resolve it to a concrete model (the router
+    // never leaks the "auto" sentinel into provider resolution).
+    model = (await resolveAutoModel(model, { content: goal, settings, userId })).model;
     // Cost control: cheap planner/executor models when configured, main model for synthesis.
     plannerModel = settings.plannerModel || model;
     execModel = settings.agentExecModel || model;

@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { getRequestUser } from "@/lib/auth";
+import { getRequestUser, unlockUser, adminResetPassword } from "@/lib/auth";
 import { db, getSetting, setSetting } from "@/lib/db";
 
 const forbidden = () => Response.json({ error: "Admins only" }, { status: 403 });
@@ -10,14 +10,33 @@ async function requireAdmin() {
   return user;
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const admin = await requireAdmin();
   if (!admin) return forbidden();
+  const sp = req.nextUrl.searchParams;
+  const search = (sp.get("q") || "").trim().toLowerCase();
+  const pageSize = Math.min(50, Math.max(1, parseInt(sp.get("pageSize") || "8", 10) || 8));
+  const page = Math.max(0, parseInt(sp.get("page") || "0", 10) || 0);
+  // Server-side search + pagination so the panel scales to thousands of users
+  // (only one page is returned). `search` is parameterized; page/size are clamped ints.
+  const where = search ? "WHERE lower(email) LIKE ? OR lower(name) LIKE ?" : "";
+  const like = `%${search}%`;
+  const total = (
+    db.prepare(`SELECT COUNT(*) AS n FROM users ${where}`).get(...(search ? [like, like] : [])) as {
+      n: number;
+    }
+  ).n;
   const users = db
-    .prepare("SELECT id, email, name, is_admin, created_at FROM users ORDER BY created_at ASC")
-    .all();
+    .prepare(
+      `SELECT id, email, name, is_admin, created_at, locked_until, auth_provider
+       FROM users ${where} ORDER BY created_at ASC LIMIT ? OFFSET ?`
+    )
+    .all(...(search ? [like, like, pageSize, page * pageSize] : [pageSize, page * pageSize]));
   return Response.json({
     users,
+    total,
+    page,
+    pageSize,
     allowSignups: getSetting("allow_signups", "global") !== "0",
     me: admin.id,
   });
@@ -39,7 +58,29 @@ export async function PATCH(req: NextRequest) {
       body.userId
     );
   }
-  return GET();
+  // Clear a brute-force lockout so the user can sign in again immediately.
+  if (body.unlockUserId) {
+    unlockUser(String(body.unlockUserId));
+  }
+  // Admin-initiated password reset: returns a one-time temp password to relay.
+  // Blocked for Google accounts — they have no password and sign in via Google.
+  if (body.resetUserId) {
+    const prov = (
+      db.prepare("SELECT auth_provider FROM users WHERE id = ?").get(String(body.resetUserId)) as
+        | { auth_provider?: string }
+        | undefined
+    )?.auth_provider;
+    if (prov === "google") {
+      return Response.json(
+        { error: "This is a Google sign-in account — it has no password to reset." },
+        { status: 400 }
+      );
+    }
+    const tempPassword = adminResetPassword(String(body.resetUserId));
+    return Response.json({ ok: true, tempPassword });
+  }
+  // The client refetches its current page after any mutation.
+  return Response.json({ ok: true });
 }
 
 export async function DELETE(req: NextRequest) {
@@ -55,11 +96,20 @@ export async function DELETE(req: NextRequest) {
     .prepare("SELECT id FROM conversations WHERE user_id = ?")
     .all(userId) as { id: string }[];
   for (const { id } of convIds) {
+    db.prepare("DELETE FROM artifact_shares WHERE artifact_id IN (SELECT id FROM artifacts WHERE conversation_id = ?)").run(id);
     db.prepare("DELETE FROM artifact_versions WHERE artifact_id IN (SELECT id FROM artifacts WHERE conversation_id = ?)").run(id);
     db.prepare("DELETE FROM artifacts WHERE conversation_id = ?").run(id);
     db.prepare("DELETE FROM branches WHERE conversation_id = ?").run(id);
     db.prepare("DELETE FROM messages WHERE conversation_id = ?").run(id);
   }
+  // Shares of the deleted user's design systems (before the systems themselves).
+  db.prepare(
+    "DELETE FROM design_system_shares WHERE design_system_id IN (SELECT id FROM design_systems WHERE user_id = ?)"
+  ).run(userId);
+  // Every table with a user_id column. http_tools notably holds a plaintext
+  // auth_secret, so leaving it orphaned would keep the user's API keys at rest
+  // after account deletion. design_system_shares/artifact_shares rows here are
+  // the ones where this user was a RECIPIENT.
   for (const table of [
     "conversations",
     "projects",
@@ -72,10 +122,18 @@ export async function DELETE(req: NextRequest) {
     "providers",
     "settings",
     "sessions",
+    "http_tools",
+    "design_systems",
+    "design_system_shares",
+    "artifact_shares",
+    "prompts",
+    "generated_images",
+    "push_subscriptions",
+    "auth_tokens",
   ]) {
     db.prepare(`DELETE FROM ${table} WHERE user_id = ?`).run(userId);
   }
   db.prepare("DELETE FROM project_members WHERE user_id = ?").run(userId);
   db.prepare("DELETE FROM users WHERE id = ?").run(userId);
-  return GET();
+  return Response.json({ ok: true });
 }

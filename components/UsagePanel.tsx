@@ -41,7 +41,6 @@ interface Account {
 
 export default function UsagePanel() {
   const [usage, setUsage] = useState<Usage | null>(null);
-  const [budget, setBudget] = useState(0);
   const [account, setAccount] = useState<Account | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showEco, setShowEco] = useState(false);
@@ -51,9 +50,6 @@ export default function UsagePanel() {
       setShowEco(localStorage.getItem("liberde:showEco") === "1");
     } catch {}
     api<Usage>("/api/usage").then(setUsage).catch((e) => setError(String(e)));
-    api<{ monthlyBudget?: number }>("/api/settings")
-      .then((s) => setBudget(s.monthlyBudget ?? 0))
-      .catch(() => {});
     api<Account>("/api/account").then(setAccount).catch(() => {});
   }, []);
 
@@ -76,7 +72,10 @@ export default function UsagePanel() {
   };
 
   return (
-    <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col gap-6 overflow-y-auto px-6 py-8">
+    // Scroll the full-width container (scrollbar at the page edge, like every
+    // other page) and cap/center the content on an inner wrapper.
+    <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-6 py-8">
       {/* max-md:pl-9 clears the floating mobile hamburger (AppShell, left-3). */}
       <div className="max-md:pl-9">
         <h1 className="font-display text-2xl font-semibold tracking-tight">Usage</h1>
@@ -115,38 +114,6 @@ export default function UsagePanel() {
           );
         })()}
 
-      {budget > 0 &&
-        (() => {
-          const now = new Date();
-          const monthStartDay = Math.floor(
-            Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 86_400_000
-          );
-          const monthCost = usage.byDay
-            .filter((d) => d.day >= monthStartDay)
-            .reduce((s, d) => s + d.cost, 0);
-          const pct = Math.min(100, Math.round((monthCost / budget) * 100));
-          return (
-            <div className="rounded-xl border border-line bg-surface p-4">
-              <div className="flex items-baseline justify-between">
-                <span className="text-sm font-medium">This month&apos;s budget</span>
-                <span className={`text-sm ${pct >= 90 ? "text-red-500" : "text-ink-muted"}`}>
-                  {money(monthCost)} of {money(budget)}
-                </span>
-              </div>
-              <div className="mt-2 h-2 overflow-hidden rounded-full bg-surface-2">
-                <div
-                  className={`h-full rounded-full ${pct >= 90 ? "bg-red-500" : pct >= 70 ? "bg-amber-500" : "bg-accent"}`}
-                  style={{ width: `${pct}%` }}
-                />
-              </div>
-              {pct >= 100 && (
-                <p className="mt-1.5 text-xs text-red-500">
-                  Budget reached — new generations are paused until next month or a higher limit.
-                </p>
-              )}
-            </div>
-          );
-        })()}
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         {[
@@ -329,6 +296,7 @@ export default function UsagePanel() {
           </table>
         </div>
       </section>
+      </div>
     </div>
   );
 }

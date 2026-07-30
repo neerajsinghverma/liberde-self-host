@@ -1,6 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+import { createRoot } from "react-dom/client";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type {
   AppSettings,
   Attachment,
@@ -70,6 +74,12 @@ export default function ChatView({
   const [messages, setMessages] = useState<Message[]>([]);
   const [streamText, setStreamText] = useState("");
   const [streamReasoning, setStreamReasoning] = useState("");
+  // FLASH-FIX: mirrors of the stream buffers, readable inside the onDone closure
+  // (which has stale state). Used to swap the live overlay for a real message
+  // atomically at stream end — no blank gap / re-parse flash. Back out: delete
+  // these two refs and revert the onDelta/onReasoning/onDone FLASH-FIX blocks.
+  const streamTextRef = useRef("");
+  const streamReasoningRef = useRef("");
   const [isStreaming, setIsStreaming] = useState(false);
   // A response is generating server-side but this client isn't attached to the
   // SSE stream (e.g. after a reload or on another device) — show a working
@@ -224,20 +234,32 @@ export default function ChatView({
   // Design systems: load the picker list in design mode; a brand-new design
   // starts on the user's default system (existing conversations keep their
   // stored choice, loaded in loadConversation).
-  useEffect(() => {
-    if (mode !== "design") return;
+  const loadDesignSystems = useCallback((applyDefault: boolean) => {
     api<DesignSystem[]>("/api/design-systems")
       .then((list) => {
         setDesignSystems(list);
         designSystemsRef.current = list;
-        if (!convIdRef.current && !dsDefaultApplied.current) {
+        if (applyDefault && !convIdRef.current && !dsDefaultApplied.current) {
           dsDefaultApplied.current = true;
           const def = list.find((s) => s.is_default);
           if (def) setDesignSystemId((cur) => cur ?? def.id);
         }
       })
       .catch(() => {});
-  }, [mode]);
+  }, []);
+
+  useEffect(() => {
+    if (mode !== "design") return;
+    loadDesignSystems(true);
+  }, [mode, loadDesignSystems]);
+
+  // Refetch when the Settings dialog adds/edits/removes a system, so a system
+  // created from the picker's "+ New…" appears in the dropdown without a reload.
+  useEffect(() => {
+    const onChanged = () => loadDesignSystems(false);
+    window.addEventListener("liberde:design-systems-changed", onChanged);
+    return () => window.removeEventListener("liberde:design-systems-changed", onChanged);
+  }, [loadDesignSystems]);
 
   // Clean up the poll on unmount.
   useEffect(() => () => stopBgPoll(), [stopBgPoll]);
@@ -433,12 +455,20 @@ export default function ChatView({
       setIsStreaming(true);
       setStreamText("");
       setStreamReasoning("");
+      streamTextRef.current = ""; // FLASH-FIX
+      streamReasoningRef.current = ""; // FLASH-FIX
       streamingIdentifierRef.current = null;
       abortRef.current = streamChat(body, {
-        onDelta: (d) => setStreamText((t) => t + d),
-        onReasoning: (d) => setStreamReasoning((t) => t + d),
+        onDelta: (d) => {
+          streamTextRef.current += d; // FLASH-FIX
+          setStreamText((t) => t + d);
+        },
+        onReasoning: (d) => {
+          streamReasoningRef.current += d; // FLASH-FIX
+          setStreamReasoning((t) => t + d);
+        },
         onToolEvent: (s) => setResearchStatuses((prev) => [...prev.slice(-11), s]),
-        onDone: async (_messageId, title, memoriesSaved, aborted) => {
+        onDone: async (messageId, title, memoriesSaved, aborted) => {
           setResearchStatuses([]);
           if (!aborted) notifyDone("Liberde", "Your response is ready");
           if (memoriesSaved) {
@@ -446,9 +476,38 @@ export default function ChatView({
             setTimeout(() => setMemoryToast(false), 4000);
           }
           abortRef.current = null;
+          // FLASH-FIX: swap the live stream overlay for a real list message in ONE
+          // render, using the SAME id the server just persisted. loadConversation
+          // then reconciles that message in place (same key) instead of leaving a
+          // blank gap during the refetch or re-mounting/re-parsing it. Back out:
+          // restore this block to the original 4 lines:
+          //   setIsStreaming(false); setStreamText(""); setStreamReasoning("");
+          const finalContent = streamTextRef.current;
+          const finalReasoning = streamReasoningRef.current;
+          if (!aborted && messageId && (finalContent || finalReasoning)) {
+            setMessages((m) =>
+              m.some((x) => x.id === messageId)
+                ? m
+                : [
+                    ...m,
+                    {
+                      id: messageId,
+                      conversation_id: body.conversationId,
+                      role: "assistant",
+                      content: finalContent,
+                      reasoning: finalReasoning || null,
+                      model: body.model && body.model !== "auto" ? body.model : null,
+                      attachments: null,
+                      created_at: Date.now(),
+                    },
+                  ]
+            );
+          }
           setIsStreaming(false);
           setStreamText("");
+          streamTextRef.current = "";
           setStreamReasoning("");
+          streamReasoningRef.current = "";
           if (convIdRef.current === body.conversationId) {
             const fresh = await loadConversation(body.conversationId);
             const list = await loadArtifacts(body.conversationId);
@@ -1219,9 +1278,27 @@ export default function ChatView({
                         : "hidden group-hover:flex"
                     }`}
                   >
-                    {msg.model && <span>{msg.model}</span>}
+                    {msg.model && (
+                      <span
+                        className="inline-flex items-center gap-1"
+                        title={
+                          msg.route_reason
+                            ? `Auto-routed — ${msg.route_reason}`
+                            : undefined
+                        }
+                      >
+                        {msg.route_reason && <Icon name="sparkles" size={12} />}
+                        {msg.route_reason ? `Auto → ${msg.model}` : msg.model}
+                      </span>
+                    )}
                     {msg.cost != null && msg.cost > 0 && (
                       <span title={costTooltip(msg)}>{fmtCost(msg.cost)}</span>
+                    )}
+                    {msg.tokens_out != null && msg.tokens_out > 0 && (
+                      <span title="Output tokens">{num(msg.tokens_out)} tok</span>
+                    )}
+                    {msg.duration_ms != null && msg.duration_ms > 0 && (
+                      <span title="Generation time">{fmtDuration(msg.duration_ms)}</span>
                     )}
                     <button
                       onClick={() => navigator.clipboard.writeText(msg.content)}
@@ -1264,6 +1341,42 @@ export default function ChatView({
                 </div>
               );
             })}
+
+            {/* A turn that died mid-tool-loop (timeout/crash) leaves the tail
+                on a tool step with no final reply — offer to pick it back up
+                instead of looking like the work silently vanished. */}
+            {!isStreaming &&
+              !bgWorking &&
+              (() => {
+                const tail = messages[messages.length - 1];
+                const interrupted =
+                  tail &&
+                  (tail.role === "tool" ||
+                    (tail.role === "assistant" &&
+                      (tail.tool_calls?.length ?? 0) > 0 &&
+                      !tail.content.trim()));
+                if (!interrupted) return null;
+                return (
+                  <div className="mb-6 flex flex-wrap items-center gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
+                    <span className="min-w-0">
+                      This turn was interrupted before the reply finished — the tool
+                      steps above are saved.
+                    </span>
+                    <button
+                      onClick={() =>
+                        convId &&
+                        startStream({ conversationId: convId, model, webSearch, think })
+                      }
+                      className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent-hover"
+                    >
+                      Continue from here
+                    </button>
+                    <span className="shrink-0 text-xs text-ink-muted">
+                      (a faster model helps — switch above, then continue)
+                    </span>
+                  </div>
+                );
+              })()}
 
             {isStreaming && (
               <div className="mb-6">
@@ -1581,6 +1694,14 @@ function fmtCost(cost: number): string {
   return `$${cost.toFixed(2)}`;
 }
 
+const num = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
+
+function fmtDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
+}
+
 /** Hover text for a message's cost: tokens + where the money went. */
 function costTooltip(msg: Message): string | undefined {
   const parts: string[] = [];
@@ -1625,34 +1746,98 @@ function escapeHtml(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Open a clean printable window and trigger print (user picks "Save as PDF"). */
+/** Render markdown to static HTML using the app's own renderer (GFM tables,
+ *  lists, code fences) — synchronously, via an offscreen React root. */
+function mdToStaticHtml(md: string): string {
+  const host = document.createElement("div");
+  const root = createRoot(host);
+  try {
+    flushSync(() => {
+      root.render(<ReactMarkdown remarkPlugins={[remarkGfm]}>{md}</ReactMarkdown>);
+    });
+    return host.innerHTML;
+  } catch {
+    return `<p style="white-space:pre-wrap">${escapeHtml(md)}</p>`;
+  } finally {
+    root.unmount();
+  }
+}
+
+/** Open a nicely typeset printable window and trigger print ("Save as PDF"). */
 function exportChatPDF(title: string, messages: Message[]) {
   const body = messages
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m) => {
-      const who = m.role === "user" ? "You" : `Liberde${m.model ? ` · ${m.model}` : ""}`;
-      // Strip artifact/run tags to keep the printout readable.
-      const text = escapeHtml(
-        m.content
-          .replace(/<liberdeArtifact[\s\S]*?(<\/liberdeArtifact>|$)/g, "[artifact]")
-          .replace(/<liberde(Run|Ask|Memory)>[\s\S]*?(<\/liberde\1>|$)/g, "")
-      );
-      return `<div class="msg ${m.role}"><div class="who">${who}</div><div class="body">${text}</div></div>`;
+      const who =
+        m.role === "user" ? "You" : `Liberde${m.model ? ` · ${escapeHtml(m.model)}` : ""}`;
+      // Replace machine tags with readable placeholders before rendering.
+      const cleaned = m.content
+        .replace(
+          /<liberdeArtifact\b[^>]*?title="([^"]*)"[\s\S]*?(<\/liberdeArtifact>|$)/g,
+          (_s, t) => `\n> 🖼 **Artifact:** ${t || "untitled"}\n`
+        )
+        .replace(/<liberdeArtifact[\s\S]*?(<\/liberdeArtifact>|$)/g, "\n> 🖼 **Artifact**\n")
+        .replace(/<liberde(Run|Ask|Memory)>[\s\S]*?(<\/liberde\1>|$)/g, "")
+        .trim();
+      const imgs = (m.images ?? [])
+        .map((src) => `<img class="genimg" src="${escapeHtml(src)}" alt="Generated image">`)
+        .join("");
+      return `<section class="msg ${m.role}">
+  <div class="who">${who}</div>
+  <div class="body md">${mdToStaticHtml(cleaned)}${imgs}</div>
+</section>`;
     })
     .join("\n");
+  const date = new Date().toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+  const replies = messages.filter((m) => m.role === "assistant").length;
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
 <style>
-  body{font:14px/1.6 -apple-system,system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 20px;color:#1a1a1a}
-  h1{font-size:22px}
-  .msg{margin:18px 0;padding-bottom:14px;border-bottom:1px solid #eee}
-  .who{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#888;margin-bottom:4px}
-  .body{white-space:pre-wrap}
-  .user .body{font-weight:500}
-  @media print{ .no-print{display:none} }
+  *{box-sizing:border-box}
+  html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{font:14px/1.65 -apple-system,"Segoe UI",system-ui,sans-serif;max-width:760px;margin:0 auto;padding:40px 24px;color:#1f1e1b;background:#fff}
+  header.doc{border-bottom:2px solid #d97757;padding-bottom:14px;margin-bottom:8px}
+  .wordmark{font-family:Georgia,serif;font-weight:700;font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:#d97757}
+  h1.doc{font-family:Georgia,serif;font-size:26px;line-height:1.25;margin:6px 0 4px}
+  .meta{font-size:12px;color:#8a857c}
+  .msg{margin:22px 0}
+  .who{font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:#8a857c;margin-bottom:6px;break-after:avoid}
+  .user .body{background:#f5f1e9;border:1px solid #ebe5d8;border-radius:12px;padding:12px 16px}
+  .genimg{display:block;max-width:100%;border-radius:10px;margin:10px 0;border:1px solid #e6e2da}
+  footer.doc{margin-top:36px;padding-top:12px;border-top:1px solid #e6e2da;font-size:11px;color:#8a857c;text-align:center}
+  /* Markdown typography */
+  .md>:first-child{margin-top:0}.md>:last-child{margin-bottom:0}
+  .md p{margin:.6em 0}
+  .md h1,.md h2,.md h3,.md h4{font-family:Georgia,serif;line-height:1.3;margin:1.1em 0 .45em;break-after:avoid}
+  .md h1{font-size:20px}.md h2{font-size:17px}.md h3{font-size:15px}.md h4{font-size:14px}
+  .md ul,.md ol{margin:.5em 0;padding-left:1.5em}
+  .md li{margin:.25em 0}
+  .md li>p{margin:.2em 0}
+  .md a{color:#b05730;text-decoration:none;border-bottom:1px solid #e0b7a3}
+  .md strong{font-weight:650}
+  .md code{background:#f4f1ea;border:1px solid #eae5da;border-radius:4px;padding:1px 5px;font:12px/1.5 ui-monospace,Consolas,monospace}
+  .md pre{background:#f7f4ee;border:1px solid #e8e3d8;border-radius:10px;padding:12px 14px;overflow:hidden;white-space:pre-wrap;word-break:break-word}
+  .md pre code{background:none;border:none;padding:0}
+  .md blockquote{border-left:3px solid #d97757;margin:.7em 0;padding:.1em 0 .1em 14px;color:#5f5a51}
+  .md table{border-collapse:collapse;margin:.8em 0;width:100%;font-size:13px}
+  .md th{background:#f4f1ea;text-align:left}
+  .md th,.md td{border:1px solid #e2ddd2;padding:6px 10px;vertical-align:top}
+  .md tr{break-inside:avoid}
+  .md hr{border:none;border-top:1px solid #e6e2da;margin:1.2em 0}
+  .md img{max-width:100%}
+  @page{margin:18mm 15mm}
 </style></head><body>
-  <h1>${escapeHtml(title)}</h1>
+  <header class="doc">
+    <div class="wordmark">Liberde</div>
+    <h1 class="doc">${escapeHtml(title)}</h1>
+    <div class="meta">${date} · ${replies} ${replies === 1 ? "reply" : "replies"}</div>
+  </header>
   ${body}
-  <script>window.onload=()=>setTimeout(()=>window.print(),300)<\/script>
+  <footer class="doc">Exported from Liberde — liberde.ai</footer>
+  <script>window.onload=()=>setTimeout(()=>window.print(),400)<\/script>
 </body></html>`;
   const w = window.open("", "_blank");
   if (w) {

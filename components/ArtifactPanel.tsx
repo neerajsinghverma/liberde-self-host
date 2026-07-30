@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ArtifactRecord, ArtifactType, ArtifactVersion } from "@/lib/artifact-shared";
 import { api } from "@/lib/client";
 import { toast } from "@/lib/ui";
-import ArtifactRenderer, { CodeView } from "./ArtifactRenderer";
+import ArtifactRenderer, { CodeView, CodeEditor } from "./ArtifactRenderer";
 import { buildSrcDoc } from "@/lib/artifact-srcdoc";
 import Icon from "./Icon";
 
@@ -45,18 +45,51 @@ const importExternal = (url: string) =>
   // Bypass the bundler: resolved in the browser at click time.
   (new Function("u", "return import(u)")(url)) as Promise<{ default: unknown; [k: string]: unknown }>;
 
+/**
+ * Open an artifact in a new tab WITHOUT letting its (untrusted, model/attacker-
+ * authored) HTML run on the liberde.ai origin. The new tab is a minimal trusted
+ * shell we control; the artifact lives inside a sandboxed iframe (no
+ * allow-same-origin → opaque origin), so it can't read cookies/localStorage or
+ * call /api. This replaces the old `window.open(blob)` / `document.write(doc)`
+ * that ran the artifact same-origin.
+ */
+function openArtifactSandboxed(doc: string, autoPrint = false) {
+  // For the PDF path, ask the deck to print ITSELF from inside the sandbox
+  // (allow-modals permits the print dialog).
+  const printScript =
+    "<script>window.addEventListener('load',function(){setTimeout(function(){try{print()}catch(e){}},500)})<\/script>";
+  const inner = autoPrint
+    ? doc.includes("</body>")
+      ? doc.replace("</body>", printScript + "</body>")
+      : doc + printScript
+    : doc;
+  const w = window.open("about:blank", "_blank");
+  if (!w) return;
+  w.document.open();
+  w.document.write(
+    '<!doctype html><html><head><meta charset="utf-8"><title>Liberde artifact</title>' +
+      "<style>html,body{margin:0;height:100%;background:#111}iframe{border:0;position:fixed;inset:0;width:100%;height:100%}</style>" +
+      "</head><body></body></html>"
+  );
+  w.document.close();
+  const ifr = w.document.createElement("iframe");
+  ifr.setAttribute("sandbox", "allow-scripts allow-forms allow-popups allow-modals");
+  ifr.srcdoc = inner; // property assignment — no escaping needed
+  w.document.body.appendChild(ifr);
+}
+
 export default function ArtifactPanel({
   content,
   onClose,
   onRecordUpdated,
   onVersionSaved,
-  designCanvas = false,
 }: {
   content: PanelContent;
   onClose: () => void;
   onRecordUpdated: (record: ArtifactRecord) => void;
   onVersionSaved?: (artifactId: string) => void;
-  /** Design workspace: present the preview floating on an artboard backdrop. */
+  /** Kept for compatibility with ChatView's prop pass; design tools now gate on
+   *  the artifact type (isVisual), not the workspace. */
   designCanvas?: boolean;
 }) {
   const isRenderable = (t: ArtifactType | null) =>
@@ -88,10 +121,12 @@ export default function ArtifactPanel({
   // Resizable panel (desktop only): a draggable divider on the left edge sets
   // the panel width; persisted so it sticks. On mobile the panel is a
   // full-screen overlay, so the custom width is ignored there.
-  const CANVAS_MIN = 360;
+  const CANVAS_MIN = 360; // smallest the canvas panel itself may shrink to
+  const CHAT_MIN = 420; // the chat column must always keep at least this much
   const [panelWidth, setPanelWidth] = useState<number | null>(null);
   const [isDesktop, setIsDesktop] = useState(true);
   const [dragging, setDragging] = useState(false);
+  const asideRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const saved = Number(localStorage.getItem("liberde-canvas-width"));
@@ -106,9 +141,16 @@ export default function ArtifactPanel({
   const startResize = (e: React.PointerEvent) => {
     e.preventDefault();
     setDragging(true);
+    // Clamp against the chat+panel container (NOT window.innerWidth — that
+    // includes the sidebar, which let the chat get squeezed to a sliver).
+    const container = asideRef.current?.parentElement;
+    const rect = container?.getBoundingClientRect();
+    const avail = rect?.width ?? window.innerWidth;
+    const rightEdge = rect ? rect.right : window.innerWidth;
     const onMove = (ev: PointerEvent) => {
-      const w = window.innerWidth - ev.clientX;
-      const clamped = Math.max(CANVAS_MIN, Math.min(window.innerWidth - CANVAS_MIN, w));
+      const w = rightEdge - ev.clientX;
+      const maxPanel = Math.max(CANVAS_MIN, avail - CHAT_MIN);
+      const clamped = Math.max(CANVAS_MIN, Math.min(maxPanel, w));
       setPanelWidth(clamped);
     };
     const onUp = () => {
@@ -171,13 +213,20 @@ export default function ArtifactPanel({
       : body;
 
   const canPreview = isRenderable(type) && !streaming;
+  // "Visual" artifacts have a rendered canvas you can point at and restyle
+  // (elements to click, CSS tokens to tweak) — so the design tools (Adjust,
+  // Comment-to-edit) apply to them in ANY workspace, not just Design mode.
+  // Markdown/mermaid/code render but have nothing to design-edit.
+  const isVisual =
+    type === "html" || type === "react" || type === "svg" || type === "slides";
   const lc = (language || "").toLowerCase();
   const canXlsx =
     !streaming && (lc === "csv" || lc === "tsv" || /(^|\n)\s*\|[^\n]*\|/.test(shownBody));
 
-  // Listen for the design-canvas bridge (token read-out + element clicks).
+  // Listen for the canvas bridge (token read-out + element clicks) for any
+  // visual artifact — the design tools now work in Chat mode too.
   useEffect(() => {
-    if (!designCanvas) return;
+    if (!isVisual) return;
     const onMsg = (e: MessageEvent) => {
       const d = (e.data || {}) as {
         __ld?: string;
@@ -197,13 +246,45 @@ export default function ArtifactPanel({
     window.addEventListener("message", onMsg);
     return () => window.removeEventListener("message", onMsg);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [designCanvas]);
+  }, [isVisual]);
 
   // Push comment-mode state into the preview.
   useEffect(() => {
-    if (designCanvas) postToIframe({ __ld: "comment", on: commentMode });
+    if (isVisual) postToIframe({ __ld: "comment", on: commentMode });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [commentMode, designCanvas, reloadKey]);
+  }, [commentMode, isVisual, reloadKey]);
+
+  // Speaker-notes edits from the slides deck (always on, not just design
+  // canvas): the iframe hands back the whole updated deck HTML; persist it as
+  // a new version so notes travel with the artifact. Deliberately SILENT — no
+  // onVersionSaved/refresh, or the deck iframe would reload under the cursor;
+  // the server holds the latest version and the iframe holds the live state.
+  const notesSaveBusy = useRef(false);
+  useEffect(() => {
+    if (type !== "slides") return;
+    const onNotes = async (e: MessageEvent) => {
+      const d = (e.data || {}) as { __ld?: string; content?: string };
+      if (d.__ld !== "notesSaved" || typeof d.content !== "string") return;
+      if (!record || streaming || notesSaveBusy.current) return;
+      const content = d.content.trim();
+      if (!content || content === shownBody.trim()) return;
+      notesSaveBusy.current = true;
+      try {
+        // Identical-content saves are a server-side no-op, so this is cheap.
+        await api(`/api/artifacts/${record.id}/versions`, {
+          method: "POST",
+          body: JSON.stringify({ content }),
+        });
+      } catch {
+        /* iframe stays dirty-capable; a later blur/close retries */
+      } finally {
+        notesSaveBusy.current = false;
+      }
+    };
+    window.addEventListener("message", onNotes);
+    return () => window.removeEventListener("message", onNotes);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [type, record?.id, streaming, shownBody]);
 
   const setToken = (name: string, value: string) => {
     setChangedTokens((c) => ({ ...c, [name]: value }));
@@ -245,8 +326,16 @@ export default function ArtifactPanel({
 
   return (
     <div
+      ref={asideRef}
       className="relative flex w-[46%] min-w-[380px] shrink-0 flex-col border-l border-line bg-surface max-lg:absolute max-lg:inset-y-0 max-lg:right-0 max-lg:z-30 max-lg:w-full max-lg:min-w-0"
-      style={isDesktop && panelWidth ? { width: panelWidth } : undefined}
+      // maxWidth's % resolves against the flex parent (chat+panel row), so the
+      // chat column always keeps >= CHAT_MIN even if a stale saved width or a
+      // drag would otherwise overshoot. Only enforced on desktop.
+      style={
+        isDesktop
+          ? { ...(panelWidth ? { width: panelWidth } : {}), maxWidth: `calc(100% - ${CHAT_MIN}px)` }
+          : undefined
+      }
     >
       {/* Drag-to-resize divider (desktop only). */}
       <div
@@ -264,9 +353,18 @@ export default function ArtifactPanel({
       {/* While dragging, an overlay swallows pointer events so the iframe
           doesn't capture them and the drag stays smooth. */}
       {dragging && <div className="fixed inset-0 z-50 cursor-col-resize" />}
-      <div className="flex items-center gap-2 border-b border-line px-3 py-2">
-        <span className="text-base">{typeIcon(type)}</span>
-        <span className="min-w-0 flex-1 truncate text-sm font-medium" title={title}>
+      <div className="flex items-center gap-2 border-b border-line px-3 py-2 max-lg:overflow-x-auto">
+        {/* Mobile: the panel is a full-screen overlay and the toolbar overflows,
+            pushing the close ✕ off-screen. Pin an always-visible Done button at
+            the far left so there's a clear way back to the chat. */}
+        <button
+          onClick={onClose}
+          className="sticky left-0 z-10 flex shrink-0 items-center gap-1 rounded-lg bg-surface-2 px-2.5 py-1 text-sm font-medium text-ink lg:hidden"
+        >
+          <Icon name="x" size={15} /> Done
+        </button>
+        <span className="text-base max-lg:hidden">{typeIcon(type)}</span>
+        <span className="min-w-0 flex-1 truncate text-sm font-medium max-lg:hidden" title={title}>
           {title}
           {streaming && <span className="ml-2 text-xs text-accent">generating…</span>}
         </span>
@@ -383,7 +481,7 @@ export default function ArtifactPanel({
             </button>
           </>
         )}
-        {designCanvas && canPreview && record && !streaming && tab === "preview" && (
+        {isVisual && canPreview && record && !streaming && tab === "preview" && (
           <>
             <button
               onClick={() => setShowAdjust((v) => !v)}
@@ -407,13 +505,7 @@ export default function ArtifactPanel({
               title="Export as PDF (opens the deck and prints — choose 'Save as PDF')"
               onClick={() => {
                 const doc = buildSrcDoc("slides", shownBody);
-                if (!doc) return;
-                const w = window.open("", "_blank");
-                if (!w) return;
-                w.document.write(doc);
-                w.document.close();
-                // Give the deck a moment to lay out, then open the print dialog.
-                w.onload = () => setTimeout(() => w.print(), 400);
+                if (doc) openArtifactSandboxed(doc, true);
               }}
               className="rounded px-1.5 py-1 text-xs text-ink-muted hover:bg-surface-2 hover:text-ink"
             >
@@ -481,9 +573,7 @@ export default function ArtifactPanel({
             title={type === "slides" ? "Present full screen (print for PDF)" : "Open full screen"}
             onClick={() => {
               const doc = buildSrcDoc(type!, shownBody);
-              if (!doc) return;
-              const blob = new Blob([doc], { type: "text/html" });
-              window.open(URL.createObjectURL(blob), "_blank");
+              if (doc) openArtifactSandboxed(doc);
             }}
             className="rounded px-1.5 py-1 text-ink-muted hover:bg-surface-2 hover:text-ink"
           >
@@ -578,22 +668,22 @@ export default function ArtifactPanel({
           <div className="flex min-h-0 flex-1 flex-col">
             {type === "markdown" || type === "html" || type === "svg" ? (
               <div className="grid min-h-0 flex-1 grid-cols-2 divide-x divide-line">
-                <textarea
+                <CodeEditor
                   value={editValue}
-                  onChange={(e) => setEditValue(e.target.value)}
-                  spellCheck={false}
-                  className="min-h-0 resize-none bg-surface-2 p-4 font-mono text-xs leading-relaxed outline-none"
+                  onChange={setEditValue}
+                  language={language ?? typeToHighlight(type)}
+                  className="flex-1"
                 />
                 <div className="min-h-0 overflow-auto">
                   <ArtifactRenderer type={type} language={language} content={editValue} />
                 </div>
               </div>
             ) : (
-              <textarea
+              <CodeEditor
                 value={editValue}
-                onChange={(e) => setEditValue(e.target.value)}
-                spellCheck={false}
-                className="min-h-0 flex-1 resize-none bg-surface-2 p-4 font-mono text-xs leading-relaxed outline-none"
+                onChange={setEditValue}
+                language={language ?? typeToHighlight(type)}
+                className="flex-1"
               />
             )}
             <div className="flex justify-end gap-2 border-t border-line px-3 py-2">
@@ -621,18 +711,18 @@ export default function ArtifactPanel({
             </div>
           </div>
         ) : tab === "preview" && canPreview && type ? (
-          designCanvas ? (
-            // Claude-Design-style artboard: the design floats as a card.
-            <div ref={previewRef} className="relative min-h-0 flex-1 overflow-auto bg-surface-2 p-5">
-              <div className="mx-auto flex h-full min-h-[420px] w-full max-w-5xl overflow-hidden rounded-2xl border border-line bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04),0_12px_32px_rgba(0,0,0,0.10)]">
-                <ArtifactRenderer
-                  type={type}
-                  language={language}
-                  content={shownBody}
-                  onRuntimeError={setRuntimeError}
-                  reloadKey={reloadKey}
-                />
-              </div>
+          isVisual ? (
+            // Visual artifacts fill the panel edge to edge (responsive, like the
+            // popped-out view) and carry the comment/adjust overlays — in any
+            // workspace. Non-visual (markdown/code) render bare below.
+            <div ref={previewRef} className="relative flex min-h-0 flex-1 overflow-hidden bg-white">
+              <ArtifactRenderer
+                type={type}
+                language={language}
+                content={shownBody}
+                onRuntimeError={setRuntimeError}
+                reloadKey={reloadKey}
+              />
 
               {commentMode && (
                 <div className="pointer-events-none absolute inset-x-0 top-3 flex justify-center">
@@ -880,6 +970,7 @@ async function exportSlidesToPptx(deckHtml: string, filename: string) {
   const PptxGenJS = (mod.default ?? mod) as new () => {
     addSlide: () => {
       addText: (text: unknown, opts: Record<string, unknown>) => void;
+      addNotes: (text: string) => void;
     };
     writeFile: (opts: { fileName: string }) => Promise<void>;
   };
@@ -890,6 +981,17 @@ async function exportSlidesToPptx(deckHtml: string, filename: string) {
   for (const section of sections) {
     if (section.tagName === "STYLE" || section.tagName === "SCRIPT") continue;
     const slide = pptx.addSlide();
+    // Speaker notes export as real PowerPoint presenter notes — never as
+    // slide body content.
+    const notes = section.querySelector("aside.notes, .notes");
+    if (notes?.textContent?.trim()) {
+      try {
+        slide.addNotes(notes.textContent.trim());
+      } catch {
+        /* older pptxgenjs — skip notes rather than fail the export */
+      }
+    }
+    const inNotes = (el: Element) => Boolean(el.closest("aside.notes, .notes"));
     const heading = section.querySelector("h1, h2, h3");
     if (heading?.textContent?.trim()) {
       slide.addText(heading.textContent.trim(), {
@@ -897,9 +999,11 @@ async function exportSlidesToPptx(deckHtml: string, filename: string) {
       });
     }
     const bullets = Array.from(section.querySelectorAll("li"))
+      .filter((li) => !inNotes(li))
       .map((li) => li.textContent?.trim())
       .filter(Boolean) as string[];
     const paragraphs = Array.from(section.querySelectorAll("p"))
+      .filter((p) => !inNotes(p))
       .map((p) => p.textContent?.trim())
       .filter((t) => t && t !== heading?.textContent?.trim()) as string[];
     const body = [

@@ -5,6 +5,7 @@ import {
   deleteMessagesFrom,
   getApiKey,
   getConversation,
+  getLastAssistantModel,
   getDesignSystem,
   getProject,
   listMessages,
@@ -15,7 +16,6 @@ import {
   updateConversation,
   updateMessageAttachments,
   saveGeneratedImage,
-  spendThisMonth,
 } from "@/lib/db";
 import {
   buildSystemPrompt,
@@ -23,12 +23,14 @@ import {
   fetchWithRetry,
   fitContextInPlace,
   getContextLimit,
+  DEFAULT_MODEL,
   getSettings,
   historyHasPdf,
   keyProblem,
   listModels,
   openRouterHeaders,
   OPENROUTER_BASE,
+  resolveAutoModel,
   STYLE_PRESETS,
   toApiMessage,
   type ChatCompletionMessage,
@@ -50,8 +52,10 @@ import {
 } from "@/lib/memory";
 import { ANALYSIS_SYSTEM_PROMPT } from "@/lib/analysis";
 import { getRequestUserId, unauthorized } from "@/lib/auth";
+import { bodyTooLarge, attachmentsProblem, MAX_CONTENT_CHARS } from "@/lib/limits";
 import { resolveChatTarget, targetHeaders, type ChatTarget } from "@/lib/providers";
 import { assembleTools, callTool } from "@/lib/mcp";
+import { assembleHttpTools, execHttpTool } from "@/lib/http-tools";
 import {
   BUILTIN_TOOL_DEFS,
   execBuiltinTool,
@@ -140,7 +144,14 @@ const sse = (obj: unknown) => `data: ${JSON.stringify(obj)}\n\n`;
 export async function POST(req: NextRequest) {
   const userId = await getRequestUserId();
   if (!userId) return unauthorized();
+  const tooLarge = bodyTooLarge(req);
+  if (tooLarge) return tooLarge;
   const body = (await req.json()) as ChatRequest;
+  const attProblem = attachmentsProblem(body.attachments);
+  if (attProblem) return attProblem;
+  if (typeof body.content === "string" && body.content.length > MAX_CONTENT_CHARS) {
+    return Response.json({ error: "Message is too long." }, { status: 413 });
+  }
   const conversation = await getConversation(body.conversationId);
   if (!conversation || (conversation.user_id && conversation.user_id !== userId)) {
     return Response.json({ error: "Conversation not found" }, { status: 404 });
@@ -160,19 +171,24 @@ export async function POST(req: NextRequest) {
     const prob = keyProblem(key);
     if (prob) return Response.json({ error: prob }, { status: 400 });
   }
+  // Auto routing: ONLY when the selected model is the AUTO sentinel. An explicit
+  // model bypasses this and resolves exactly as before.
+  // eslint-disable-next-line prefer-const -- reassigned on the Auto 404 fallback below
+  let { model, routeReason } = await resolveAutoModel(requestedModel, {
+    content: body.content ?? "",
+    hasImage: body.attachments?.some((a) => a.mime?.startsWith("image/")) ?? false,
+    designMode: conversation.mode === "design",
+    priorModel: requestedModel === "auto" ? getLastAssistantModel(conversation.id) : null,
+    settings,
+    userId,
+  });
   let target: ChatTarget;
   try {
-    target = await resolveChatTarget(requestedModel, userId);
+    target = await resolveChatTarget(model, userId);
   } catch (e) {
     return Response.json({ error: String(e) }, { status: 400 });
   }
 
-  if (settings.monthlyBudget > 0 && (await spendThisMonth(userId)) >= settings.monthlyBudget) {
-    return Response.json(
-      { error: `Monthly budget of $${settings.monthlyBudget} reached. Raise it in Settings → General.` },
-      { status: 402 }
-    );
-  }
 
   if (!(await tryLockConversation(conversation.id))) {
     return Response.json(
@@ -185,7 +201,8 @@ export async function POST(req: NextRequest) {
   // assembly, PDF extraction, pre-search). Guard it so the lock is always
   // released on a setup failure — otherwise the conversation stays locked.
   try {
-  const model = requestedModel;
+  // `model` is the routed concrete model; the conversation keeps the AUTO
+  // sentinel (body.model) so every future turn re-routes.
   if (body.model && body.model !== conversation.model) {
     await updateConversation(conversation.id, { model: body.model });
   }
@@ -252,6 +269,8 @@ export async function POST(req: NextRequest) {
   const designImages = designMode && body.designImages === true && !!imageModel;
 
   const { tools: mcpTools, errors: toolErrors } = await assembleTools(userId);
+  // eslint-disable-next-line prefer-const -- re-assembled when create_http_tool adds one mid-turn
+  let { defs: httpDefs, names: httpToolNames } = await assembleHttpTools(userId);
   const tools = [
     ...BUILTIN_TOOL_DEFS,
     ...PLATFORM_TOOL_DEFS,
@@ -259,6 +278,7 @@ export async function POST(req: NextRequest) {
     ...(designImages ? [DESIGN_IMAGE_TOOL] : []),
     ...(memoryActive ? MEMORY_TOOL_DEFS : []),
     ...(recallActive ? RECALL_TOOL_DEFS : []),
+    ...httpDefs,
     ...mcpTools,
   ];
   const designDirective =
@@ -279,13 +299,15 @@ Give each 2–4 concrete options (the user can also type their own), and lead wi
 ## 2. Build
 Build the full self-contained artifact. Make it genuinely beautiful and modern: deliberate type scale, spacing rhythm, a cohesive palette declared as CSS custom properties in :root (so it's trivially tweakable), strong hierarchy, depth, responsive, accessible contrast. Real interactivity — working buttons/tabs/nav, hover/press states, transitions — it must feel like a real working app, not a static mockup. You may use Google Fonts via <link>.
 
+FILL THE VIEWPORT: for full-page designs — apps, dashboards, landing pages, web-app clones, tools — set html,body{margin:0} and make the top-level layout span the whole viewport (width:100%; min-height:100vh), so it fills the canvas edge to edge like a real product. Do NOT wrap the entire UI in a centered fixed max-width card floating on a background — that "small window" look is only appropriate when the design IS deliberately a device/phone mockup or a single centered widget (e.g. a login card). Inner content may still use max-width containers for readability; it's the OUTER shell that must fill the screen.
+
 For IMAGERY: ${
         designImages
-          ? "to create custom visuals — hero images, photos, illustrations, icons, backgrounds, slide artwork — call the generate_image tool with a vivid prompt and embed the URL it returns in an <img src=\"…\">. This uses a dedicated image model, so the design gets real, on-brief assets. Do this for images that materially improve the design; call it a few times for the key visuals."
+          ? "to create custom visuals — hero images, photos, illustrations, icons, backgrounds, slide artwork — ALWAYS call the generate_image tool with a vivid prompt and embed the URL it returns in an <img src=\"…\">. The tool routes to the user's chosen image model, so use it for EVERY generated image — never claim you cannot pick a provider, and never rely on your own native image output. Do this for images that materially improve the design; call it a few times for the key visuals."
           : "use images from images.unsplash.com or picsum.photos for any imagery (there is no image-generation tool in this mode)."
       }
 
-For SLIDE DECKS: emit the artifact as a slides type (<liberdeArtifact type="slides" …>), with each slide as a top-level \`<section class="slide">\` element — this unlocks the built-in deck player, arrow-key/on-screen navigation, print-to-PDF, and PowerPoint (.pptx) export. Put a clear heading (h1/h2) and concise bullet/paragraph content in each slide (one idea per slide) and keep the text as plain static HTML so it stays editable and exports cleanly. Define the theme via CSS custom properties in :root.
+For SLIDE DECKS: emit the artifact as a slides type (<liberdeArtifact type="slides" …>), with each slide as a top-level \`<section class="slide">\` element — this unlocks the built-in deck player (each slide is a FIXED 1920×1080 canvas scaled to fit — design in absolute pixels for it and make every slide's content fit; overflow is clipped), arrow-key/on-screen navigation, print-to-PDF, and PowerPoint (.pptx) export. Put a clear heading (h1/h2) and concise bullet/paragraph content in each slide (one idea per slide) and keep the text as plain static HTML so it stays editable and exports cleanly. Define the theme via CSS custom properties in :root. End each slide with speaker notes — <aside class="notes">1–3 sentences the presenter would say</aside> — hidden on the slide itself, editable in the player's 🗒 notes panel, exported as PowerPoint presenter notes.
 
 ## 3. Tweak surgically
 When the user asks for a change, edit ONLY what they asked and PRESERVE everything else — layout, spacing, fonts, positions, and colors you weren't asked to touch. Update the CURRENT artifact with a targeted change; never rewrite from scratch or "improve" unrelated parts. Common tweaks: recolor the palette, restyle a single slide/screen, rewrite copy, add/remove a slide, swap an image, change the vibe.
@@ -394,6 +416,9 @@ ${ds.spec}`;
       const finalImages: string[] = [];
       let useExtReasoning = body.think && !target.isOpenRouter;
       let useTools = tools.length > 0;
+      // Set when OpenRouter 402s on pre-authorization (low balance can't cover
+      // the model's maximum output reservation) — retry with an affordable cap.
+      let maxTokensCap: number | null = null;
       // Last-resort fallback: some models/providers reject optional features
       // (web/pdf plugins, reasoning, tools) with an error that isn't specific
       // enough to pattern-match. When set, we resend a bare request.
@@ -402,11 +427,27 @@ ${ds.spec}`;
       // (usually weaker) model ends up promising to build something but never
       // emits the artifact block — a common failure in design mode.
       let forcedArtifactDone = false;
+  // Auto routing can pick a model this account can't access (needs provider
+  // enablement / data policy) → 404. Fall back once to the user's default model
+  // (known-good) so an Auto pick never hard-fails on a 404.
+  let autoFellBack = false;
       // Don't start the (extra, full) forced-synthesis turn if the request is
       // already close to the function's maxDuration (300s) — being hard-killed
       // mid-synthesis loses the artifact and wedges the conversation lock.
       const turnStart = Date.now();
       const FORCE_SYNTH_DEADLINE_MS = 180_000;
+      // Hard turn deadline: a zombie upstream stream (accepted the request,
+      // then drips error frames forever — seen with saturated free endpoints)
+      // otherwise pins the read loop until Vercel hard-kills the function at
+      // maxDuration, which persists nothing and strands the lock. Abort the
+      // upstream ourselves with time to spare so partials persist and the
+      // lock releases.
+      const turnAbort = new AbortController();
+      const hardStop = setTimeout(() => turnAbort.abort(), 270_000);
+      const turnSignal =
+        typeof AbortSignal.any === "function"
+          ? AbortSignal.any([req.signal, turnAbort.signal])
+          : req.signal;
       let reasoningStartedAt: number | null = null;
       let reasoningEndedAt: number | null = null;
       let totalCost = preSearchCost;
@@ -421,6 +462,7 @@ ${ds.spec}`;
         errored = false,
         clientGone = false,
       }: { errored?: boolean; clientGone?: boolean } = {}) => {
+        clearTimeout(hardStop);
         // External clouds report tokens, not dollars — estimate from configured
         // prices here (not on the happy path only) so aborted/errored turns
         // still record cost and count toward the monthly budget.
@@ -471,6 +513,8 @@ ${ds.spec}`;
             tokens_in: totalTokensIn || null,
             tokens_out: totalTokensOut || null,
             cost_breakdown: costBreakdown,
+            duration_ms: Date.now() - turnStart,
+            route_reason: routeReason,
           });
           savedId = saved.id;
           try {
@@ -506,8 +550,13 @@ ${ds.spec}`;
       const contextLimit = await getContextLimit(requestedModel);
       // Some models emit images natively as an output modality (Gemini image,
       // GPT-4o image, etc.) — ask for image output when the model supports it.
+      // BUT when the user has opted into design AI-images with a dedicated
+      // image model, force imagery through the generate_image tool so THAT
+      // model is used — otherwise a chat model that also outputs images would
+      // silently make them itself and ignore the chosen image model.
       const outputsImages =
         target.isOpenRouter &&
+        !designImages &&
         ((await listModels().catch(() => [])).find((m) => m.id === requestedModel)
           ?.outputsImages ??
           false);
@@ -520,11 +569,24 @@ ${ds.spec}`;
 
       try {
         for (let round = 0; round < MAX_TOOL_ROUNDS + 1; round++) {
+          // Wall-clock budget: starting another upstream round too close to the
+          // function's maxDuration (300s) risks a hard kill that persists
+          // NOTHING — the turn silently vanishes on reload (seen with slow free
+          // models + PDFs + multiple tool rounds). Wrap up instead.
+          if (round > 0 && Date.now() - turnStart > 200_000) {
+            emit({ toolEvent: { status: "Out of time for more steps this turn — wrapping up" } });
+            if (!finalText.trim() && !finalImages.length) {
+              finalText =
+                "I ran out of time this turn (slow model + long inputs) after the tool steps above — their results are saved. Say **continue** to pick up from here, or switch to a faster model and retry.";
+            }
+            break;
+          }
           const reqBody = JSON.stringify({
               model: target.bodyModel,
               messages: apiMessages,
               stream: true,
               temperature: settings.temperature,
+              ...(maxTokensCap ? { max_tokens: maxTokensCap } : {}),
               ...(useTools && round < MAX_TOOL_ROUNDS && !minimalMode ? { tools } : {}),
               // Provider-specific extras.
               ...(target.isOpenRouter
@@ -556,10 +618,32 @@ ${ds.spec}`;
             method: "POST",
             headers: targetHeaders(target, reqBody),
             body: reqBody,
-          }, { signal: req.signal });
+          }, { signal: turnSignal });
 
           if (!upstream.ok || !upstream.body) {
             const detail = await upstream.text();
+            // OpenRouter pre-authorizes the model's MAX output length: with a
+            // low balance it 402s even though the actual reply would cost
+            // pennies ("requested up to 65536 tokens, but can only afford N").
+            // Retry once with an affordable max_tokens cap.
+            const afford = detail.match(/can only afford (\d+)/i);
+            if (upstream.status === 402 && afford && !maxTokensCap) {
+              maxTokensCap = Math.max(1024, Math.floor(Number(afford[1]) * 0.9));
+              emit({
+                toolEvent: {
+                  status: `OpenRouter balance is low — capping this reply at ${maxTokensCap.toLocaleString()} tokens so it can run`,
+                },
+              });
+              round--;
+              continue;
+            }
+            if (upstream.status === 402) {
+              emit({
+                error:
+                  "Your OpenRouter balance is too low to reserve this model's output. Top up at openrouter.ai/settings/credits, or switch to a cheaper/free model.",
+              });
+              break;
+            }
             // Models that don't take reasoning_effort get a retry without it.
             if (useExtReasoning && /reasoning/i.test(detail)) {
               useExtReasoning = false;
@@ -591,6 +675,29 @@ ${ds.spec}`;
               upstream.status === 404 ||
               /no (allowed )?(endpoints|providers)|data policy|privacy settings/i.test(detail)
             ) {
+              // Auto routed to a model this account can't access — retry once on
+              // the user's default (known-good) model instead of hard-failing.
+              const fb =
+                settings.defaultModel && settings.defaultModel !== "auto"
+                  ? settings.defaultModel
+                  : DEFAULT_MODEL;
+              if (routeReason && !autoFellBack && fb !== model) {
+                autoFellBack = true;
+                try {
+                  target = await resolveChatTarget(fb, userId);
+                  model = fb;
+                  routeReason = `${routeReason} → fell back (first pick unavailable)`;
+                  emit({
+                    toolEvent: {
+                      status: "Auto's first pick wasn't available on your account — switching to your default model",
+                    },
+                  });
+                  round--;
+                  continue;
+                } catch {
+                  /* fall through to the error below */
+                }
+              }
               emit({
                 error:
                   `This model isn't available for your OpenRouter account (${upstream.status}). ` +
@@ -713,18 +820,16 @@ ${ds.spec}`;
 
           const calls = toolCalls.filter(Boolean);
           if (calls.length === 0 || round >= MAX_TOOL_ROUNDS) {
-            // Rescue: the model finished (or ran out of tool rounds) having
-            // promised an artifact but without ever emitting the block — it
-            // often loops on artifact_read/generate_image and narrates "building
-            // it now…" instead. Force exactly one tools-off turn to produce it.
+            // Rescue (DESIGN MODE ONLY): a design turn is expected to end in an
+            // artifact; if the model narrated "building it now…" but never emitted
+            // the block, force one tools-off turn to produce it. This NEVER runs in
+            // normal chat — there it wrongly discarded good answers (e.g. "Here's
+            // the comparison: …") and replaced them with a confabulated
+            // "what artifact do you want?" turn.
             const noArtifact = !/<liberdeArtifact/i.test(finalText);
-            // If the model deliberately asked clarifying questions (ask-first
-            // design flow), it is NOT trying to build yet — never override that.
+            // If the model asked clarifying questions (ask-first flow), it is NOT
+            // trying to build yet — never override that.
             const askedQuestions = /<liberdeAsk/i.test(finalText);
-            const promised =
-              /\b(build|building|here it is|here'?s the|let me build|creating|producing|generating the|no more delay|actual artifact)\b/i.test(
-                finalText
-              );
             if (
               !forcedArtifactDone &&
               useTools &&
@@ -732,7 +837,10 @@ ${ds.spec}`;
               noArtifact &&
               !askedQuestions &&
               Date.now() - turnStart < FORCE_SYNTH_DEADLINE_MS &&
-              (designMode || promised)
+              // Only when there's no real answer yet (short narration), and only
+              // in the design workspace.
+              finalText.trim().length < 600 &&
+              designMode
             ) {
               forcedArtifactDone = true;
               emit({ toolEvent: { status: "Producing the artifact…" } });
@@ -756,7 +864,7 @@ ${ds.spec}`;
                 const fbRes = await fetchWithRetry(
                   target.url,
                   { method: "POST", headers: targetHeaders(target, fbBody), body: fbBody },
-                  { signal: req.signal }
+                  { signal: turnSignal }
                 );
                 if (fbRes.ok && fbRes.body) {
                   const rd = fbRes.body.getReader();
@@ -840,6 +948,13 @@ ${ds.spec}`;
               }
             } else if (call.function.name === "artifact_read") {
               output = await execArtifactRead(conversation.id, call.function.arguments);
+            } else if (/^(liberde_?run|run_?(js|javascript|code|python)|code_?(execution|interpreter)|execute_?(code|javascript))$/i.test(call.function.name)) {
+              // The analysis tool is a <liberdeRun>…</liberdeRun> TAG the client
+              // runs in a browser sandbox — NOT a callable function. Weaker
+              // models sometimes invoke it as a tool; steer them to the tag
+              // instead of dead-ending on "no connected server provides…".
+              output =
+                "There is no runnable function for code — the analysis tool works by writing a <liberdeRun>…</liberdeRun> block directly in your reply (JavaScript, runs in the browser sandbox, result comes back automatically). Do NOT call a tool for this. Put your code inside <liberdeRun></liberdeRun> in your next message instead.";
             } else if (isMemoryTool(call.function.name)) {
               output = await execMemoryTool(call.function.name, call.function.arguments, userId);
             } else if (isRecallTool(call.function.name)) {
@@ -856,6 +971,9 @@ ${ds.spec}`;
               // the model can call the new tools in this same conversation turn.
               if (result.toolsChanged) {
                 const { tools: refreshedMcp } = await assembleTools(userId);
+                const refreshedHttp = await assembleHttpTools(userId);
+                httpDefs = refreshedHttp.defs;
+                httpToolNames = refreshedHttp.names;
                 tools.length = 0;
                 tools.push(
                   ...BUILTIN_TOOL_DEFS,
@@ -864,6 +982,7 @@ ${ds.spec}`;
                   ...(designImages ? [DESIGN_IMAGE_TOOL] : []),
                   ...(memoryActive ? MEMORY_TOOL_DEFS : []),
                   ...(recallActive ? RECALL_TOOL_DEFS : []),
+                  ...httpDefs,
                   ...refreshedMcp
                 );
               }
@@ -881,6 +1000,8 @@ ${ds.spec}`;
                 finalAnnotations.push(...result.annotations);
                 emit({ annotations: result.annotations });
               }
+            } else if (httpToolNames.has(call.function.name)) {
+              output = await execHttpTool(call.function.name, call.function.arguments, userId);
             } else {
               output = await callTool(call.function.name, call.function.arguments, userId);
             }
@@ -903,10 +1024,16 @@ ${ds.spec}`;
         await finalize();
       } catch (e) {
         // Persist whatever we have. Distinguish a client disconnect (nobody to
-        // notify) from a real upstream/tool failure (surface a terminal error).
+        // notify) and our own turn deadline (persist a friendly note, no error)
+        // from a real upstream/tool failure (surface a terminal error).
         const clientGone = req.signal.aborted;
-        if (!clientGone) console.error("chat stream failed:", e);
-        await finalize({ errored: !clientGone, clientGone });
+        const deadline = turnAbort.signal.aborted && !clientGone;
+        if (deadline && !finalText.trim() && !finalImages.length) {
+          finalText =
+            "I ran out of time this turn — the steps above are saved. Say **continue** to pick up from here, or switch to a faster model and retry.";
+        }
+        if (!clientGone && !deadline) console.error("chat stream failed:", e);
+        await finalize({ errored: !clientGone && !deadline, clientGone });
       }
     },
   });
