@@ -20,7 +20,13 @@ The same app that powers [liberde.ai](https://liberde.ai), re-plumbed to run ent
 
 This is the **self-host build**. Data lives in a local **SQLite** file (`data/liberde.db`) via `better-sqlite3` — there's nothing to provision, no database to connect, and nothing leaves your machine unless you make an outbound model/tool call. Because it runs as a **long-lived process** (not serverless functions), it can do things a serverless deploy can't: connect to **local stdio MCP servers**, run scheduled tasks on an in-process timer, and run long agent/research jobs with no function time limit.
 
-> Prefer not to self-host? [liberde.ai](https://liberde.ai) is the hosted version (Postgres/Vercel) of the same app.
+> ### Two editions, same app
+> This repo is the **self-host** build (single SQLite file, one Node process). The same app runs hosted at **[liberde.ai](https://liberde.ai)** if you'd rather not run it yourself. Same features; only the storage/runtime differ.
+>
+> | Edition | Repo | Stack | Use it to… |
+> |---|---|---|---|
+> | 🖥️ **Self-host** | **liberde-self-host** (this repo) | single SQLite file, one Node process | run it yourself, no DB to provision |
+> | ☁️ **Hosted / cloud** | [**liberde**](https://github.com/neerajsinghverma/liberde) | Postgres (Neon) + Vercel | deploy a public multi-user service (powers liberde.ai) |
 
 ## Highlights
 
