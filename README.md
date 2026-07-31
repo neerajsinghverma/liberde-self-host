@@ -31,6 +31,29 @@ This is the **self-host build**. Data lives in a local **SQLite** file (`data/li
 - 🔌 **MCP connectors & 🛠 custom API tools** — add any MCP server (**local stdio command** or remote HTTP, incl. full OAuth 2.1) *or* define your own REST endpoints as callable tools.
 - 📚 **Skills, memory & recall**, 👥 **multi-user** with full row-level isolation and an admin panel, plus **second opinion, voice, image gen, office exports, cost tracking, dark mode, PWA** — and more below.
 
+## How it compares
+
+Liberde isn't the only open-source AI chat app — [LibreChat](https://github.com/danny-avila/LibreChat), [Open WebUI](https://github.com/open-webui/open-webui), and [LobeChat](https://github.com/lobehub/lobe-chat) are all excellent projects. Here's where Liberde is genuinely different.
+
+*Legend: ✅ built-in · ⚠️ partial / via plugin / community · ❌ not available. These projects all move fast — check their docs for the current state.*
+
+| | **Liberde** | LibreChat | Open WebUI | LobeChat |
+|---|:---:|:---:|:---:|:---:|
+| Model access | **OpenRouter-native**<br>1 key, 400+ models | multi-provider<br>(+OpenRouter) | Ollama + OpenAI-<br>compatible | 40+ providers |
+| Claude-style artifacts (versioned, live) | ✅ | ✅ | ⚠️ | ✅ |
+| **Design Studio** (interactive prototypes / decks / sites) | ✅ | ❌ | ❌ | ❌ |
+| **✨ Auto** per-message model routing | ✅ | ❌ | ❌ | ❌ |
+| Multi-model side-by-side compare | ✅ | ❌ | ✅ | ⚠️ |
+| Web search **+ deep research** | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| MCP connectors (stdio + HTTP + OAuth) | ✅ | ✅ | ⚠️ | ✅ |
+| No-code custom REST tools (+ OpenAPI import) | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| Built-in API server + CLI + desktop + PWA | ✅ all four | ⚠️ | ⚠️ | ⚠️ |
+| Cost + token **+ environmental** transparency | ✅ | ⚠️ | ⚠️ | ❌ |
+| Zero-config self-host (single SQLite file) | ✅ | ❌ (MongoDB) | ✅ | ⚠️ |
+| Secrets encrypted at rest (key in env) | ✅ | ⚠️ | ⚠️ | ⚠️ |
+
+**Where Liberde stands out:** the **Design Studio**, **✨ Auto** per-message routing, **cost + environmental transparency**, an **OpenRouter-native one-key** setup (400+ models, no per-provider config), **single-file self-hosting**, and shipping as a **whole platform** — web + OpenAI-compatible API + CLI + desktop + PWA — rather than just a chat UI.
+
 ## The platform
 
 | Piece | Where | What it is |
