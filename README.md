@@ -12,7 +12,7 @@ The same app that powers [liberde.ai](https://liberde.ai), re-plumbed to run ent
 [![SQLite](https://img.shields.io/badge/SQLite-local%20file-003b57?logo=sqlite&logoColor=white)](https://www.sqlite.org)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
-[Quick start](#quick-start) · [Configuration](#configuration) · [How it runs](#how-it-runs) · [Features](#features) · [Security](#security)
+[Quick start](#quick-start) · [Configuration](#configuration) · [How it runs](#how-it-runs) · [Features](#features) · [Security](#security) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -40,6 +40,8 @@ This is the **self-host build**. Data lives in a local **SQLite** file (`data/li
 - 🏢 **Workspaces, roles & spend caps** — owner / admin / member / viewer, with a monthly budget for the workspace or per person; over-budget requests are refused *before* a model is called.
 - 🔒 **Tamper-evident audit log** — hash-chained record of logins, key creation, tool calls, skill imports and membership changes; verify the chain on demand, export JSONL or CEF for a SIEM.
 - 💸 **Prompt caching** — explicit cache breakpoints for the model families that need them, so later turns in a long thread re-read the stable prefix at a fraction of the price.
+
+> 📜 **What shipped when:** [CHANGELOG.md](CHANGELOG.md), or the browsable version at [liberde.ai/changelog.html](https://liberde.ai/changelog.html).
 
 ## How it compares
 
@@ -171,7 +173,7 @@ Everything is in the single SQLite file. **Backup = copy `data/liberde.db`** (id
 - **Recall** — the model can search your own past conversations as a tool
 - **Planner/executor model split** — route planning/execution to cheaper models while the final deliverable keeps your main model
 - **Projects** — group chats under shared instructions + knowledge files
-- **Semantic project retrieval** — project knowledge is embedded and searched by meaning, so a paragraph that answers the question in different words is still found. Configure any OpenAI-compatible `/embeddings` endpoint (OpenAI, a local Ollama, LM Studio) via the `embedding_api_key` / `embedding_base_url` / `embedding_model` settings; files are indexed on upload. Relevance is judged **relative to the best match** rather than against a fixed score, because embedding models don't share a scale and any absolute cut-off is tuned for exactly one of them. With no endpoint configured it falls back to the lexical scorer — a knowledge base that gets less clever is fine, one that silently stops working because a key expired is not
+- **Semantic project retrieval** — project knowledge is embedded and searched by meaning, so a paragraph that answers the question in different words is still found. Point it at any OpenAI-compatible `/embeddings` endpoint (OpenAI, a local Ollama, LM Studio) in **Settings → General → Semantic search**; files are indexed as you upload them, and one button indexes the projects you already had. Relevance is judged **relative to the best match** rather than against a fixed score, because embedding models don't share a scale and any absolute cut-off is tuned for exactly one of them. With no endpoint configured it falls back to the lexical scorer — a knowledge base that gets less clever is fine, one that silently stops working because a key expired is not
 - **Design studio** — a separate Chat/Design workspace: asks one round of clarifying questions, builds on a live canvas, element-select commenting, per-slide edits, live color/spacing sliders, AI-generated imagery
 - **Design systems** — save named brand specs and lock designs to one; create by describing the brand **or by attaching screenshots** (a vision model extracts real colors/fonts), "Remix with AI"
 - **Artifacts gallery** — every artifact you've built, and everything shared with you, in one browsable grid at `/artifacts`: card previews that pull the headings and prose out of the source (not the first 600 characters of a stylesheet) plus a strip of the artifact's own palette, filters for All / Yours / Shared with you, and full-text search across titles and contents. Opening one of yours jumps to its conversation; opening a shared one clones an editable copy
