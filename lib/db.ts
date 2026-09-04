@@ -3,6 +3,12 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import { encryptSecret, decryptSecret } from "./crypto-secrets";
+import {
+  can,
+  isWorkspaceRole,
+  type WorkspaceBudget,
+  type WorkspaceRole,
+} from "./workspaces";
 import type {
   AgentRun,
   AgentStep,
@@ -12,6 +18,7 @@ import type {
   HttpTool,
   HttpToolAuth,
   HttpToolParam,
+  DiscoveredTool,
   Message,
   Project,
   ProjectFile,
@@ -189,6 +196,57 @@ function createDb(): Database.Database {
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL
     );
+    -- Audit log (see lib/audit.ts). Appended only through audit(), which
+    -- wraps the read-hash-insert in a transaction so the chain cannot fork.
+    -- AUTOINCREMENT, not bare rowid: retention deletes old rows, and a reused
+    -- seq would make the chain order ambiguous.
+    CREATE TABLE IF NOT EXISTS audit_log (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      id TEXT NOT NULL UNIQUE,
+      at INTEGER NOT NULL,
+      user_id TEXT,
+      action TEXT NOT NULL,
+      target_type TEXT,
+      target_id TEXT,
+      detail TEXT,
+      ip TEXT,
+      prev_hash TEXT NOT NULL,
+      hash TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS audit_log_at_idx ON audit_log (at);
+    CREATE INDEX IF NOT EXISTS audit_log_user_idx ON audit_log (user_id);
+    CREATE INDEX IF NOT EXISTS audit_log_action_idx ON audit_log (action);
+    -- One row holding the chain head.
+    CREATE TABLE IF NOT EXISTS audit_chain (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      head TEXT NOT NULL DEFAULT ''
+    );
+    INSERT OR IGNORE INTO audit_chain (id, head) VALUES (1, '');
+    -- Partial text of a reply still streaming, so a reload mid-turn picks the
+    -- answer up in progress. One row per conversation, dropped when it lands.
+    CREATE TABLE IF NOT EXISTS live_turns (
+      conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+      text TEXT NOT NULL DEFAULT '',
+      updated_at INTEGER NOT NULL
+    );
+    -- Workspaces (see lib/workspaces.ts): membership and spend policy only.
+    -- Resources stay owned by users, so nothing here re-parents them.
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      monthly_budget_usd REAL,
+      per_member_budget_usd REAL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS workspace_members (
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'member',
+      added_at INTEGER NOT NULL,
+      PRIMARY KEY (workspace_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS workspace_members_user_idx ON workspace_members (user_id);
     CREATE TABLE IF NOT EXISTS http_tools (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL DEFAULT 'local',
@@ -274,9 +332,15 @@ function createDb(): Database.Database {
   ensureColumn(db, "messages", "cost", "REAL");
   ensureColumn(db, "messages", "tokens_in", "INTEGER");
   ensureColumn(db, "messages", "tokens_out", "INTEGER");
+  // Prompt-cache accounting: input tokens served from cache, and the saving
+  // the provider reports for them.
+  ensureColumn(db, "messages", "cached_tokens_in", "INTEGER");
+  ensureColumn(db, "messages", "cache_discount", "REAL");
   ensureColumn(db, "connectors", "oauth_data", "TEXT");
   ensureColumn(db, "connectors", "tools_cache", "TEXT");
   ensureColumn(db, "connectors", "last_tested", "INTEGER");
+  ensureColumn(db, "connectors", "auto_run", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "connectors", "disabled_tools", "TEXT");
   ensureColumn(db, "skills", "connector_ids", "TEXT");
   ensureColumn(db, "skills", "http_tool_ids", "TEXT");
   ensureColumn(db, "conversations", "locked_at", "INTEGER");
@@ -471,6 +535,33 @@ export function tryLockConversation(id: string): boolean {
     )
     .run(nowTs, id, stale);
   return res.changes > 0;
+}
+
+/**
+ * Publish the partial text of an in-flight reply.
+ *
+ * Called on a throttle from the streaming loop rather than per token: the
+ * write is cheap here, but a reader a second behind is fine when the
+ * alternative is no text at all.
+ */
+export function setLiveTurn(conversationId: string, text: string): void {
+  db.prepare(
+    "INSERT INTO live_turns (conversation_id, text, updated_at) VALUES (?, ?, ?) " +
+      "ON CONFLICT (conversation_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at"
+  ).run(conversationId, text, Date.now());
+}
+
+/** Drop the buffer once the real message is saved (or the turn dies). */
+export function clearLiveTurn(conversationId: string): void {
+  db.prepare("DELETE FROM live_turns WHERE conversation_id = ?").run(conversationId);
+}
+
+/** Partial text for a conversation, or null when no turn is in flight. */
+export function getLiveTurn(conversationId: string): string | null {
+  const row = db
+    .prepare("SELECT text FROM live_turns WHERE conversation_id = ?")
+    .get(conversationId) as { text?: string } | undefined;
+  return row?.text ? row.text : null;
 }
 
 export function unlockConversation(id: string) {
@@ -838,6 +929,8 @@ export function addMessage(
     cost?: number | null;
     tokens_in?: number | null;
     tokens_out?: number | null;
+    cached_tokens_in?: number | null;
+    cache_discount?: number | null;
     cost_breakdown?: string | null;
     duration_ms?: number | null;
     route_reason?: string | null;
@@ -859,13 +952,15 @@ export function addMessage(
     cost: extras.cost ?? null,
     tokens_in: extras.tokens_in ?? null,
     tokens_out: extras.tokens_out ?? null,
+    cached_tokens_in: extras.cached_tokens_in ?? null,
+    cache_discount: extras.cache_discount ?? null,
     cost_breakdown: extras.cost_breakdown ?? null,
     duration_ms: extras.duration_ms ?? null,
     route_reason: extras.route_reason ?? null,
     created_at: now(),
   };
   db.prepare(
-    "INSERT INTO messages (id, conversation_id, role, content, model, attachments, reasoning, annotations, images, tool_calls, tool_call_id, reasoning_ms, cost, tokens_in, tokens_out, cost_breakdown, duration_ms, route_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO messages (id, conversation_id, role, content, model, attachments, reasoning, annotations, images, tool_calls, tool_call_id, reasoning_ms, cost, tokens_in, tokens_out, cached_tokens_in, cache_discount, cost_breakdown, duration_ms, route_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(
     msg.id,
     msg.conversation_id,
@@ -882,6 +977,8 @@ export function addMessage(
     msg.cost,
     msg.tokens_in,
     msg.tokens_out,
+    msg.cached_tokens_in,
+    msg.cache_discount,
     msg.cost_breakdown,
     msg.duration_ms,
     msg.route_reason,
@@ -1831,19 +1928,19 @@ export interface Connector {
   url: string | null;
   headers: string | null; // JSON object
   oauth_data: string | null; // JSON: tokens, client info, verifier, redirect
-  tools_cache: string | null; // JSON: [{name, description}] discovered on last test
+  tools_cache: string | null; // JSON: [{name, description, annotations?}] discovered on last test
   last_tested: number | null;
   enabled: number;
+  /** Allow tools the server marks as writing/destructive to run unattended. */
+  auto_run: number;
+  disabled_tools: string | null; // JSON array of original tool names to hide
   user_id: string;
   created_at: number;
 }
 
 /** Persist the tool list discovered by a successful connector test, so the UI
  *  can show a server's functions instantly without reconnecting each time. */
-export function setConnectorTools(
-  id: string,
-  tools: { name: string; description: string }[]
-) {
+export function setConnectorTools(id: string, tools: DiscoveredTool[]) {
   db.prepare("UPDATE connectors SET tools_cache = ?, last_tested = ? WHERE id = ?").run(
     JSON.stringify(tools),
     now(),
@@ -1914,11 +2011,15 @@ export function createConnector(
     tools_cache: null,
     last_tested: null,
     enabled: 1,
+    // New connectors start guarded: a tool the server declares as writing
+    // needs the user to allow it first.
+    auto_run: 0,
+    disabled_tools: null,
     user_id: userId,
     created_at: now(),
   };
   db.prepare(
-    "INSERT INTO connectors (id, name, transport, command, args, url, headers, oauth_data, tools_cache, last_tested, enabled, user_id, created_at) VALUES (@id, @name, @transport, @command, @args, @url, @headers, @oauth_data, @tools_cache, @last_tested, @enabled, @user_id, @created_at)"
+    "INSERT INTO connectors (id, name, transport, command, args, url, headers, oauth_data, tools_cache, last_tested, enabled, auto_run, disabled_tools, user_id, created_at) VALUES (@id, @name, @transport, @command, @args, @url, @headers, @oauth_data, @tools_cache, @last_tested, @enabled, @auto_run, @disabled_tools, @user_id, @created_at)"
   ).run({ ...record, headers: encryptSecret(record.headers) });
   return record as Connector;
 }
@@ -1928,8 +2029,13 @@ export function updateConnector(id: string, fields: Partial<Connector>) {
   if (!record) return;
   const merged = { ...record, ...fields };
   db.prepare(
-    "UPDATE connectors SET name=@name, transport=@transport, command=@command, args=@args, url=@url, headers=@headers, enabled=@enabled WHERE id=@id"
-  ).run({ ...merged, headers: encryptSecret(merged.headers) });
+    "UPDATE connectors SET name=@name, transport=@transport, command=@command, args=@args, url=@url, headers=@headers, enabled=@enabled, auto_run=@auto_run, disabled_tools=@disabled_tools WHERE id=@id"
+  ).run({
+    ...merged,
+    headers: encryptSecret(merged.headers),
+    auto_run: merged.auto_run ?? 0,
+    disabled_tools: merged.disabled_tools ?? null,
+  });
 }
 
 export function deleteConnector(id: string) {
@@ -2344,4 +2450,176 @@ export function verifyPlatformApiKey(key: string): string | null {
   if (!row) return null;
   db.prepare("UPDATE api_keys SET last_used_at = ? WHERE id = ?").run(now(), row.id);
   return row.user_id || DEFAULT_USER;
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces (see lib/workspaces.ts for the role and budget policy)
+
+export interface Workspace {
+  id: string;
+  name: string;
+  owner_id: string;
+  monthly_budget_usd: number | null;
+  per_member_budget_usd: number | null;
+  created_at: number;
+}
+
+export interface WorkspaceMember {
+  workspace_id: string;
+  user_id: string;
+  role: WorkspaceRole;
+  added_at: number;
+  email?: string;
+  name?: string;
+}
+
+/** Create a workspace and seat its creator as owner. */
+export function createWorkspace(name: string, ownerId: string): Workspace {
+  const ws: Workspace = {
+    id: newId(),
+    name,
+    owner_id: ownerId,
+    monthly_budget_usd: null,
+    per_member_budget_usd: null,
+    created_at: now(),
+  };
+  db.prepare(
+    "INSERT INTO workspaces (id, name, owner_id, monthly_budget_usd, per_member_budget_usd, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run(ws.id, ws.name, ws.owner_id, null, null, ws.created_at);
+  db.prepare(
+    "INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role, added_at) VALUES (?, ?, 'owner', ?)"
+  ).run(ws.id, ownerId, ws.created_at);
+  return ws;
+}
+
+export function getWorkspace(id: string): Workspace | null {
+  return (db.prepare("SELECT * FROM workspaces WHERE id = ?").get(id) as Workspace) ?? null;
+}
+
+/** Workspaces this user belongs to, with the role they hold in each. */
+export function listWorkspacesForUser(userId: string): (Workspace & { role: WorkspaceRole })[] {
+  return db
+    .prepare(
+      "SELECT w.*, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id WHERE m.user_id = ? ORDER BY w.created_at ASC"
+    )
+    .all(userId) as (Workspace & { role: WorkspaceRole })[];
+}
+
+/** The caller's role in a workspace, or null when they are not a member. */
+export function workspaceRole(workspaceId: string, userId: string): WorkspaceRole | null {
+  const row = db
+    .prepare("SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?")
+    .get(workspaceId, userId) as { role?: string } | undefined;
+  return isWorkspaceRole(row?.role) ? row.role : null;
+}
+
+export function updateWorkspace(
+  id: string,
+  fields: Partial<Pick<Workspace, "name" | "monthly_budget_usd" | "per_member_budget_usd">>
+): void {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  for (const key of ["name", "monthly_budget_usd", "per_member_budget_usd"] as const) {
+    if (fields[key] !== undefined) {
+      params.push(fields[key]);
+      sets.push(key + " = ?");
+    }
+  }
+  if (!sets.length) return;
+  params.push(id);
+  db.prepare("UPDATE workspaces SET " + sets.join(", ") + " WHERE id = ?").run(...params);
+}
+
+export function deleteWorkspace(id: string): void {
+  db.prepare("DELETE FROM workspace_members WHERE workspace_id = ?").run(id);
+  db.prepare("DELETE FROM workspaces WHERE id = ?").run(id);
+}
+
+/** Members with the account details an admin screen needs to show them. */
+export function listWorkspaceMembers(workspaceId: string): WorkspaceMember[] {
+  return db
+    .prepare(
+      "SELECT m.*, u.email, u.name FROM workspace_members m LEFT JOIN users u ON u.id = m.user_id WHERE m.workspace_id = ? ORDER BY m.added_at ASC"
+    )
+    .all(workspaceId) as WorkspaceMember[];
+}
+
+/** Add or re-role a member. Idempotent, so a repeated invite is not an error. */
+export function upsertWorkspaceMember(
+  workspaceId: string,
+  userId: string,
+  role: WorkspaceRole
+): void {
+  db.prepare(
+    "INSERT INTO workspace_members (workspace_id, user_id, role, added_at) VALUES (?, ?, ?, ?) ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = excluded.role"
+  ).run(workspaceId, userId, role, now());
+}
+
+export function removeWorkspaceMember(workspaceId: string, userId: string): void {
+  db.prepare("DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?").run(
+    workspaceId,
+    userId
+  );
+}
+
+/** How many owners a workspace has, so the last one can't be removed. */
+export function countWorkspaceOwners(workspaceId: string): number {
+  const row = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM workspace_members WHERE workspace_id = ? AND role = 'owner'"
+    )
+    .get(workspaceId) as { n?: number } | undefined;
+  return Number(row?.n ?? 0);
+}
+
+/**
+ * Month-to-date spend across every member of a workspace.
+ *
+ * Cost lives on messages, which belong to users rather than workspaces, so this
+ * sums the members' own spend instead of reading a workspace ledger. A user in
+ * two workspaces counts fully toward both, which is the conservative reading
+ * and matches how checkBudgets applies the caps.
+ */
+export function workspaceSpendThisMonth(workspaceId: string): number {
+  const d = new Date();
+  const monthStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+  const row = db
+    .prepare(
+      "SELECT COALESCE(SUM(m.cost), 0) AS cost FROM messages m " +
+        "JOIN conversations c ON c.id = m.conversation_id " +
+        "JOIN workspace_members wm ON wm.user_id = c.user_id " +
+        "WHERE wm.workspace_id = ? AND m.role = 'assistant' AND m.created_at >= ?"
+    )
+    .get(workspaceId, monthStart) as { cost?: number } | undefined;
+  return Number(row?.cost) || 0;
+}
+
+/**
+ * Budget state for every workspace a user belongs to, ready for checkBudgets.
+ *
+ * Workspaces with no cap and no view-only restriction are dropped before the
+ * spend queries run: they can never block anything, and each one skipped is an
+ * aggregate over the whole messages table avoided on the hot path.
+ */
+export function workspaceBudgetsFor(userId: string): WorkspaceBudget[] {
+  const binding = listWorkspacesForUser(userId).filter(
+    (w) =>
+      w.monthly_budget_usd != null ||
+      w.per_member_budget_usd != null ||
+      !can(w.role, "spend")
+  );
+  if (binding.length === 0) return [];
+
+  const memberSpend = binding.some((w) => w.per_member_budget_usd != null)
+    ? spendThisMonth(userId)
+    : 0;
+
+  return binding.map((w) => ({
+    name: w.name,
+    monthlyBudgetUsd: w.monthly_budget_usd,
+    perMemberBudgetUsd: w.per_member_budget_usd,
+    workspaceSpend: w.monthly_budget_usd != null ? workspaceSpendThisMonth(w.id) : 0,
+    memberSpend,
+    role: w.role,
+  }));
 }

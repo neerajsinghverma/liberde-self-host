@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import {
   deleteConversation,
   getConversation,
+  getLiveTurn,
   listMessages,
   updateConversation,
 } from "@/lib/db";
@@ -33,7 +34,18 @@ export async function GET(_req: NextRequest, { params }: Params) {
   const conv = check.conv!;
   const generating =
     conv.locked_at != null && Date.now() - conv.locked_at < GENERATING_TTL_MS;
-  return Response.json({ ...conv, generating, messages: listMessages(id) });
+  // Only while a turn is actually in flight: outside that window any row is
+  // a leftover from a killed run, and showing it would resurrect a reply the
+  // user already has in full. Cosmetic, so it fails soft.
+  let live: string | null = null;
+  if (generating) {
+    try {
+      live = getLiveTurn(id);
+    } catch {
+      live = null;
+    }
+  }
+  return Response.json({ ...conv, generating, live, messages: listMessages(id) });
 }
 
 export async function PATCH(req: NextRequest, { params }: Params) {
