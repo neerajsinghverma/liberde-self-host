@@ -2816,8 +2816,15 @@ export function createAgent(
   };
   db.prepare(
     "INSERT INTO agents (id, user_id, name, description, model, instructions, project_id, skill_ids, connector_ids, http_tool_ids, icon, created_at) " +
-      "VALUES (@id, @user_id, @name, @description, @model, @instructions, @project_id, @icon, @created_at)"
-  ).run(agent);
+      "VALUES (@id, @user_id, @name, @description, @model, @instructions, @project_id, @skill_ids, @connector_ids, @http_tool_ids, @icon, @created_at)"
+  ).run({
+    ...agent,
+    // better-sqlite3 binds primitives only, so the id arrays go in as JSON —
+    // the same shape rowToAgent reads back out.
+    skill_ids: JSON.stringify(agent.skill_ids),
+    connector_ids: JSON.stringify(agent.connector_ids),
+    http_tool_ids: JSON.stringify(agent.http_tool_ids),
+  });
   return agent;
 }
 

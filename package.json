@@ -8,7 +8,9 @@
     "start": "next start",
     "audit": "node scripts/audit-platform.mjs",
     "test:logic": "tsx scripts/test-logic.ts",
-    "verify": "npm run audit && npm run test:logic && npx tsc --noEmit"
+    "verify": "npm run audit && npm run test:logic && npx tsc --noEmit && npm run test:browser",
+    "test:browser": "tsx scripts/test-sandbox-browser.ts",
+    "test:e2e": "tsx scripts/test-e2e.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
