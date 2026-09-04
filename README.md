@@ -36,6 +36,9 @@ This is the **self-host build**. Data lives in a local **SQLite** file (`data/li
 - ✦ **Agentic Plan mode** — plan-then-execute with the full tool belt.
 - 🔌 **MCP connectors & 🛠 custom API tools** — add any MCP server (**local stdio command** or remote HTTP, incl. full OAuth 2.1) *or* define your own REST endpoints as callable tools.
 - 📚 **Skills, memory & recall**, 👥 **multi-user** with full row-level isolation and an admin panel, plus **second opinion, voice, image gen, office exports, cost tracking, dark mode, PWA** — and more below.
+- 🏢 **Workspaces, roles & spend caps** — owner / admin / member / viewer, with a monthly budget for the workspace or per person; over-budget requests are refused *before* a model is called.
+- 🔒 **Tamper-evident audit log** — hash-chained record of logins, key creation, tool calls, skill imports and membership changes; verify the chain on demand, export JSONL or CEF for a SIEM.
+- 💸 **Prompt caching** — explicit cache breakpoints for the model families that need them, so later turns in a long thread re-read the stable prefix at a fraction of the price.
 
 ## How it compares
 
@@ -58,7 +61,9 @@ Liberde isn't the only open-source AI chat app — [LibreChat](https://github.co
 | Zero-config self-host (single SQLite file) | ✅ | ❌ (MongoDB) | ✅ | ⚠️ |
 | Secrets encrypted at rest (key in env) | ✅ | ⚠️ | ⚠️ | ⚠️ |
 
-**Where Liberde stands out:** the **Design Studio**, **✨ Auto** per-message routing, **cost + environmental transparency**, an **OpenRouter-native one-key** setup (400+ models, no per-provider config), **single-file self-hosting**, and shipping as a **whole platform** — web + OpenAI-compatible API + CLI + desktop + PWA — rather than just a chat UI.
+**Where Liberde stands out:** **✨ Auto** per-message routing, **cost + environmental transparency**, an **OpenRouter-native one-key** setup (400+ models, no per-provider config), **single-file self-hosting**, a **tamper-evident audit log with workspace roles and spend caps**, and shipping as a **whole platform** — web + OpenAI-compatible API + CLI + desktop + PWA — rather than just a chat UI.
+
+A note on honesty: live artifacts, MCP and conversation branching were differentiators when this table was first written and are table stakes now — they are listed above because you should expect them, not because they set Liberde apart. The **Design Studio** is good and it is not unique either; the hosted assistants ship comparable canvases. What none of them can offer is running the whole thing **on your own machine, under your own key, with an audit trail you can verify** — which is why that is the first thing in the list rather than the last.
 
 ## The platform
 
@@ -138,8 +143,8 @@ Everything is in the single SQLite file. **Backup = copy `data/liberde.db`** (id
 
 - **Streaming chat** with stop, regenerate, and edit-and-resend
 - **Any OpenRouter model**, searchable picker with pricing and context size; switch models mid-conversation
-- **✨ Auto model routing** — pick the right model per message (fast / balanced / deep tiers) with a cheap classifier, thread stickiness, and a runtime fallback if a routed model isn't available on your account
-- **Second opinion** — run the same question through 2–4 models side by side (streaming columns, per-model cost/tokens), then swap the reply you prefer into the thread; the original is kept as a switchable branch
+- **✨ Auto model routing** — picks the right model per message (fast / balanced / deep). Tiers come from the live *price* distribution rather than model-name patterns, so a vendor rename never quietly drops a flagship out of the deep tier. Most messages are placed from local signals with no extra API call; only genuinely ambiguous ones pay for a classification step. Thread stickiness and a runtime fallback if a routed model isn't available on your account
+- **Second opinion + council verdict** — run the same question through 2–4 models side by side (streaming columns, per-model cost/tokens), then swap the reply you prefer into the thread; the original is kept as a switchable branch. When the answers land, a **separate** model writes a verdict: what they all agree on, every place they genuinely contradict each other, and one consolidated answer you can keep in a click
 - **Bring your own clouds** (Settings → Providers) — **OpenAI/Anthropic (direct)**, **Azure AI Foundry**, **AWS Bedrock**, **Google Gemini/Vertex**, or any **custom OpenAI-compatible endpoint** (Groq, Ollama, vLLM…); per-user, full feature parity (web search, PDF extraction, reasoning effort, cost estimates)
 - **Models & pricing page** (`/models`) — the live OpenRouter catalog as cards: prices, context size, capability filters (🖼 vision / 🔧 tools / 🎨 image / 🆓 free), your live credit balance, one-click "Chat →" / "Set default"
 - **Web search, Claude-style** — built-in `web_search` and `fetch_page`; activity trail, source cards, citations
@@ -147,6 +152,13 @@ Everything is in the single SQLite file. **Backup = copy `data/liberde.db`** (id
 - **Plan mode** (✦) — plan-then-execute with the full tool belt; live checklist, final deliverable (often an artifact)
 - **MCP connectors** — add any MCP server (**local stdio command or remote HTTP**) in Settings → Connectors; tools become callable mid-conversation. Remote servers support bearer tokens **and the full MCP OAuth 2.1 flow** (discovery, dynamic client registration, PKCE)
 - **Custom HTTP/REST tools** — define your own API endpoints as callable tools: a manual builder with a Test button, **OpenAPI 3.x import**, or let the model add one mid-chat (`create_http_tool`). Per-user secrets, a write-guard on non-GET methods, and skills can bundle tools
+- **Workspaces, roles and spend caps** — owner / admin / member / viewer. An admin can manage members but cannot mint or demote an owner, and the last owner cannot be removed. Set a monthly workspace budget, a per-person allowance, or both; an over-budget request is refused with a message naming the limit it hit, before any model is called
+- **Tamper-evident audit log** (Admin → Audit) — each entry is hashed against the one before it, so an edited or deleted row breaks verification and reports which one. Tool arguments are logged by *name* only, never by value, because the log outlives the conversation. Verify on demand; export JSONL or CEF; retention is configurable and defaults to keeping everything. On SQLite the chain is written inside a single transaction rather than a stored procedure, but the hashed payload is byte-identical to the hosted build, so a chain written by either verifies under both
+- **Prompt caching** — Anthropic and Qwen bill the whole prompt again each turn unless a `cache_control` breakpoint says otherwise; every other family on OpenRouter caches automatically and is left alone. The system prompt is split into a stable head and a volatile tail so the cached prefix stays byte-identical between turns
+- **Parallel agent steps** — the planner marks which steps are independent; those run at the same time while dependent steps stay ordered
+- **Reload mid-reply** — a reply in flight is mirrored server-side, so reloading picks the answer up in progress instead of showing a spinner until it lands
+- **Queued messages** — type while a reply is streaming and it waits rather than vanishing; it sends when the turn finishes
+- **Agent Skills (SKILL.md) interop** — skills follow the open [Agent Skills](https://agentskills.io) standard, so one written for Claude Code, claude.ai, VS Code or Codex loads here unchanged, and yours export the same way. Import single files or a whole skills folder
 - **Skills** — reusable procedures with progressive disclosure (the model loads full instructions only when the task matches); can reference connector and custom-tool names
 - **Voice conversations** (🎧), **editable artifacts** (✏ / select-and-💬), **office exports** (slides → .pptx, docs → .doc)
 - **Analysis tool** — the model runs JavaScript in a browser sandbox (`<liberdeRun>`) and iterates on the output
