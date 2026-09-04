@@ -26,7 +26,7 @@ import type {
 
 // ---- At-rest secret encryption (AES-256-GCM, key in env; see crypto-secrets) ----
 // Settings whose value is a secret and must be encrypted before it hits the DB.
-const SECRET_SETTING_KEYS = new Set(["openrouter_api_key"]);
+const SECRET_SETTING_KEYS = new Set(["openrouter_api_key", "embedding_api_key"]);
 // Provider-config fields that hold secrets.
 const SECRET_CONFIG_FIELDS = ["apiKey", "secretAccessKey", "secretKey", "token"];
 
@@ -229,6 +229,23 @@ function createDb(): Database.Database {
       text TEXT NOT NULL DEFAULT '',
       updated_at INTEGER NOT NULL
     );
+    -- Chunk embeddings (see lib/rag.ts). Keyed by model: changing the
+    -- embedding model invalidates nothing, it just stops matching, so old
+    -- rows are ignored and re-indexed rather than silently compared against
+    -- vectors from a different space.
+    CREATE TABLE IF NOT EXISTS chunk_embeddings (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      vector TEXT NOT NULL,
+      model TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS chunk_embeddings_project_idx ON chunk_embeddings (project_id, model);
+    CREATE INDEX IF NOT EXISTS chunk_embeddings_file_idx ON chunk_embeddings (file_id);
     -- Workspaces (see lib/workspaces.ts): membership and spend policy only.
     -- Resources stay owned by users, so nothing here re-parents them.
     CREATE TABLE IF NOT EXISTS workspaces (
@@ -1590,6 +1607,9 @@ export function addProjectFile(projectId: string, name: string, content: string)
 }
 
 export function deleteProjectFile(id: string, projectId?: string) {
+  // Vectors first: a file whose chunks outlive it would keep being retrieved,
+  // and the user has no way to see why a deleted document still answers.
+  deleteFileChunks(id);
   // When projectId is given, scope the delete to it so a caller can't remove a
   // file that belongs to a different (foreign) project.
   if (projectId) {
@@ -2622,4 +2642,100 @@ export function workspaceBudgetsFor(userId: string): WorkspaceBudget[] {
     memberSpend,
     role: w.role,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Chunk embeddings (see lib/rag.ts, lib/embeddings.ts)
+
+export interface StoredChunk {
+  id: string;
+  project_id: string;
+  file_id: string;
+  file_name: string;
+  chunk_index: number;
+  text: string;
+  vector: number[];
+}
+
+/**
+ * Vectors are stored as JSON rather than in a vector extension.
+ *
+ * A project's knowledge is tens to low hundreds of chunks, so the similarity
+ * pass is a few thousand multiply-adds in JavaScript — cheaper than the network
+ * round trip that fetched the query embedding. It also keeps the self-host
+ * build a single file with no extension to install, which is the whole promise
+ * of this edition. Reach for sqlite-vec when one project stops fitting
+ * comfortably in memory.
+ */
+export function replaceFileChunks(
+  projectId: string,
+  fileId: string,
+  fileName: string,
+  chunks: { text: string; vector: number[] }[],
+  model: string
+): void {
+  const insert = db.prepare(
+    "INSERT INTO chunk_embeddings (id, project_id, file_id, file_name, chunk_index, text, vector, model, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  );
+  db.transaction(() => {
+    db.prepare("DELETE FROM chunk_embeddings WHERE file_id = ?").run(fileId);
+    chunks.forEach((c, i) => {
+      insert.run(
+        newId(),
+        projectId,
+        fileId,
+        fileName,
+        i,
+        c.text,
+        JSON.stringify(c.vector),
+        model,
+        now()
+      );
+    });
+  })();
+}
+
+export function deleteFileChunks(fileId: string): void {
+  db.prepare("DELETE FROM chunk_embeddings WHERE file_id = ?").run(fileId);
+}
+
+/**
+ * Every stored chunk for a project, for the in-memory similarity pass. A row
+ * whose vector will not parse is skipped rather than thrown on: one corrupt
+ * row should cost its own chunk, not the whole retrieval.
+ */
+export function listProjectChunks(projectId: string, model: string): StoredChunk[] {
+  const rows = db
+    .prepare(
+      "SELECT * FROM chunk_embeddings WHERE project_id = ? AND model = ? ORDER BY file_name, chunk_index"
+    )
+    .all(projectId, model) as Record<string, unknown>[];
+  const out: StoredChunk[] = [];
+  for (const r of rows) {
+    try {
+      const vector = JSON.parse(String(r.vector)) as number[];
+      if (!Array.isArray(vector) || vector.length === 0) continue;
+      out.push({
+        id: r.id as string,
+        project_id: r.project_id as string,
+        file_id: r.file_id as string,
+        file_name: r.file_name as string,
+        chunk_index: Number(r.chunk_index),
+        text: r.text as string,
+        vector,
+      });
+    } catch {
+      /* skip an unreadable row */
+    }
+  }
+  return out;
+}
+
+/** Which files already have usable vectors, so indexing can skip them. */
+export function indexedFileIds(projectId: string, model: string): Set<string> {
+  const rows = db
+    .prepare("SELECT DISTINCT file_id FROM chunk_embeddings WHERE project_id = ? AND model = ?")
+    .all(projectId, model) as { file_id: string }[];
+  return new Set(rows.map((r) => r.file_id));
 }
