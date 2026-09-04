@@ -34,6 +34,7 @@ This is the **self-host build**. Data lives in a local **SQLite** file (`data/li
 - 🎨 **Artifacts & a Design Studio** — versioned, publishable HTML / React / SVG / Mermaid / Markdown / code / **slide decks**, rendered live in a sandboxed iframe; a separate Design workspace with brand-locked **design systems**.
 - 🔍 **Web search & 🔬 Deep Research** — built-in `web_search`/`fetch_page` with citations, plus a parallel research pipeline that streams a cited report.
 - ✦ **Agentic Plan mode** — plan-then-execute with the full tool belt.
+- 🐍 **Code interpreter in your browser** — the model runs real Python (pandas, numpy, matplotlib, scipy, scikit-learn) on your attached files and hands back charts and spreadsheets, in a sandboxed frame on your own machine. No sandbox service, no per-run cost, nothing to configure.
 - 🔌 **MCP connectors & 🛠 custom API tools** — add any MCP server (**local stdio command** or remote HTTP, incl. full OAuth 2.1) *or* define your own REST endpoints as callable tools.
 - 📚 **Skills, memory & recall**, 👥 **multi-user** with full row-level isolation and an admin panel, plus **second opinion, voice, image gen, office exports, cost tracking, dark mode, PWA** — and more below.
 - 🏢 **Workspaces, roles & spend caps** — owner / admin / member / viewer, with a monthly budget for the workspace or per person; over-budget requests are refused *before* a model is called.
@@ -56,6 +57,7 @@ Liberde isn't the only open-source AI chat app — [LibreChat](https://github.co
 | Web search **+ deep research** | ✅ | ⚠️ | ⚠️ | ⚠️ |
 | MCP connectors (stdio + HTTP + OAuth) | ✅ | ✅ | ⚠️ | ✅ |
 | No-code custom REST tools (+ OpenAPI import) | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| Code interpreter (Python, reads your files, no server) | ✅ | ⚠️ | ✅ | ⚠️ |
 | Built-in API server + CLI + desktop + PWA | ✅ all four | ⚠️ | ⚠️ | ⚠️ |
 | Cost + token **+ environmental** transparency | ✅ | ⚠️ | ⚠️ | ❌ |
 | Zero-config self-host (single SQLite file) | ✅ | ❌ (MongoDB) | ✅ | ⚠️ |
@@ -63,7 +65,7 @@ Liberde isn't the only open-source AI chat app — [LibreChat](https://github.co
 
 **Where Liberde stands out:** **✨ Auto** per-message routing, **cost + environmental transparency**, an **OpenRouter-native one-key** setup (400+ models, no per-provider config), **single-file self-hosting**, a **tamper-evident audit log with workspace roles and spend caps**, and shipping as a **whole platform** — web + OpenAI-compatible API + CLI + desktop + PWA — rather than just a chat UI.
 
-A note on honesty: live artifacts, MCP and conversation branching were differentiators when this table was first written and are table stakes now — they are listed above because you should expect them, not because they set Liberde apart. The **Design Studio** is good and it is not unique either; the hosted assistants ship comparable canvases. What none of them can offer is running the whole thing **on your own machine, under your own key, with an audit trail you can verify** — which is why that is the first thing in the list rather than the last.
+A note on honesty: live artifacts, MCP and conversation branching were differentiators when this table was first written and are table stakes now — they are listed above because you should expect them, not because they set Liberde apart. The **Design Studio** is good and it is not unique either; the hosted assistants ship comparable canvases. **Browser-run Python is not a differentiator against Open WebUI**, which ships the same Pyodide approach — it is here because a code interpreter that needs no sandbox service, no credentials and no per-run billing is the right design for a self-hostable app, not because it is ours alone. What none of them can offer is running the whole thing **on your own database, under your own key, with an audit trail you can verify** — which is why that is the first thing in the list rather than the last.
 
 ## The platform
 
@@ -161,7 +163,7 @@ Everything is in the single SQLite file. **Backup = copy `data/liberde.db`** (id
 - **Agent Skills (SKILL.md) interop** — skills follow the open [Agent Skills](https://agentskills.io) standard, so one written for Claude Code, claude.ai, VS Code or Codex loads here unchanged, and yours export the same way. Import single files or a whole skills folder
 - **Skills** — reusable procedures with progressive disclosure (the model loads full instructions only when the task matches); can reference connector and custom-tool names
 - **Voice conversations** (🎧), **editable artifacts** (✏ / select-and-💬), **office exports** (slides → .pptx, docs → .doc)
-- **Analysis tool** — the model runs JavaScript in a browser sandbox (`<liberdeRun>`) and iterates on the output
+- **Code interpreter, in the browser** — the model writes code, runs it, and reads the output (`<liberdeRun>`). Two runtimes share the tag: JavaScript for instant arithmetic and logic checks, and **Python** — real CPython in WebAssembly with pandas, numpy, matplotlib, scipy, scikit-learn and openpyxl, loaded on demand from the code's own imports. Conversation attachments are mounted as real files at `/data`, anything written to `/out` comes back as a download (matplotlib figures are captured automatically), and the kernel is kept alive per conversation so variables and dataframes survive between blocks. It runs in a sandboxed frame with an opaque origin on the user's own machine: no server, no per-run cost, nothing to configure, and identical behaviour on a self-hosted install
 - **Scheduled tasks** (⏰) — daily or every-N-hours prompts run by the in-process scheduler; each run lands in a new ⏰-prefixed conversation
 - **Branching** — editing/regenerating keeps the old tail as a ⑂ variant (branches never leak into each other's context)
 - **Extended thinking** (💭), **image generation** (🎨, default `google/gemini-3.1-flash-image`)
@@ -169,8 +171,10 @@ Everything is in the single SQLite file. **Backup = copy `data/liberde.db`** (id
 - **Recall** — the model can search your own past conversations as a tool
 - **Planner/executor model split** — route planning/execution to cheaper models while the final deliverable keeps your main model
 - **Projects** — group chats under shared instructions + knowledge files
+- **Semantic project retrieval** — project knowledge is embedded and searched by meaning, so a paragraph that answers the question in different words is still found. Configure any OpenAI-compatible `/embeddings` endpoint (OpenAI, a local Ollama, LM Studio) via the `embedding_api_key` / `embedding_base_url` / `embedding_model` settings; files are indexed on upload. Relevance is judged **relative to the best match** rather than against a fixed score, because embedding models don't share a scale and any absolute cut-off is tuned for exactly one of them. With no endpoint configured it falls back to the lexical scorer — a knowledge base that gets less clever is fine, one that silently stops working because a key expired is not
 - **Design studio** — a separate Chat/Design workspace: asks one round of clarifying questions, builds on a live canvas, element-select commenting, per-slide edits, live color/spacing sliders, AI-generated imagery
 - **Design systems** — save named brand specs and lock designs to one; create by describing the brand **or by attaching screenshots** (a vision model extracts real colors/fonts), "Remix with AI"
+- **Artifacts gallery** — every artifact you've built, and everything shared with you, in one browsable grid at `/artifacts`: card previews that pull the headings and prose out of the source (not the first 600 characters of a stylesheet) plus a strip of the artifact's own palette, filters for All / Yours / Shared with you, and full-text search across titles and contents. Opening one of yours jumps to its conversation; opening a shared one clones an editable copy
 - **User-to-user sharing** — share design systems *and* artifacts to another user by email; artifacts land in their "Shared with you" view where "Open & edit a copy" clones into their own Design conversation
 - **Attachments** — paste/drag images (auto-downscaled like Claude), **PDFs** (server-side text extraction), text/code files
 - **Personalization** ("about you" + "response style"), **web push** (Plan/task-done notifications), **share chats** (immutable `/share/<id>`), **temporary chats** (no memory, auto-purged 24h)
@@ -188,6 +192,7 @@ Liberde implements the same artifact architecture as Claude.ai:
 - `update` commands are exact str-replace patches (`<liberdeOld>`/`<liberdeNew>`) applied server-side — small edits don't regenerate the whole artifact. Every command creates a new **version**.
 - Types: `html`, `react`, `svg`, `mermaid`, `markdown`, `code`, and **`slides`** (full presentations with arrow-key navigation, ⛶ Present mode, print-CSS PDF export). HTML/React/SVG/Mermaid render live in a **sandboxed iframe** (React compiled in-browser via Babel, deps from esm.sh; Tailwind CDN).
 - **Publish** any artifact for a stable public link at `/a/<id>` (always-latest or version-pinned), or a full-screen hosted page at `/live/<id>`. Viewers can **Remix** into their own conversation.
+- **The gallery** (`/artifacts`) collects everything you've made and everything shared with you, with previews, filters, and search across contents.
 
 ## Platform API
 
