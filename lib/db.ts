@@ -2834,3 +2834,99 @@ export function deleteAgent(id: string, userId: string): void {
   db.prepare("UPDATE conversations SET agent_id = NULL WHERE agent_id = ?").run(id);
   db.prepare("DELETE FROM agents WHERE id = ? AND user_id = ?").run(id, userId);
 }
+
+/** One card in the artifacts gallery. */
+export interface GalleryArtifact {
+  id: string;
+  conversation_id: string;
+  conversation_title: string;
+  identifier: string;
+  type: string;
+  language: string | null;
+  title: string;
+  share_id: string | null;
+  updated_at: number;
+  /** Opening characters of the latest version, for the card preview. */
+  preview: string;
+  /** Whose it is: "mine" or the owner's name when shared with the caller. */
+  owner: string;
+}
+
+/** How much of a version to read for a card preview. */
+const PREVIEW_CHARS = 600;
+
+/**
+ * Every artifact the caller owns, newest first.
+ *
+ * The preview comes from the highest version via a lateral join rather than a
+ * second query per row: a gallery is the one place where the N+1 actually shows
+ * up, because the whole point is showing a lot of them at once. Only the first
+ * few hundred characters are read — a card shows a thumbnail of the content,
+ * and pulling entire artifacts to render a snippet would move megabytes to
+ * draw a grid.
+ */
+export function listOwnedArtifacts(
+  userId: string,
+  limit = 200
+): GalleryArtifact[] {
+  const rows = db.prepare(
+    `SELECT a.id, a.conversation_id, a.identifier, a.type, a.language, a.title,
+            a.share_id, a.updated_at,
+            c.title AS conversation_title,
+            substr((SELECT content FROM artifact_versions
+                    WHERE artifact_id = a.id ORDER BY version DESC LIMIT 1), 1, ?) AS preview
+     FROM artifacts a
+     JOIN conversations c ON c.id = a.conversation_id
+     WHERE c.user_id = ?
+     ORDER BY a.updated_at DESC
+     LIMIT ?`
+  ).all(PREVIEW_CHARS, userId, limit) as Record<string, unknown>[];
+  return rows.map((r) => ({
+    id: r.id as string,
+    conversation_id: r.conversation_id as string,
+    conversation_title: (r.conversation_title as string) ?? "",
+    identifier: r.identifier as string,
+    type: r.type as string,
+    language: (r.language as string) ?? null,
+    title: r.title as string,
+    share_id: (r.share_id as string) ?? null,
+    updated_at: Number(r.updated_at),
+    preview: (r.preview as string) ?? "",
+    owner: "mine",
+  }));
+}
+
+/** The same shape for artifacts other people shared with the caller. */
+export function listSharedArtifactCards(
+  userId: string,
+  limit = 200
+): GalleryArtifact[] {
+  const rows = db.prepare(
+    `SELECT a.id, a.conversation_id, a.identifier, a.type, a.language, a.title,
+            a.share_id, a.updated_at,
+            c.title AS conversation_title,
+            u.name AS owner_name,
+            substr((SELECT content FROM artifact_versions
+                    WHERE artifact_id = a.id ORDER BY version DESC LIMIT 1), 1, ?) AS preview
+     FROM artifact_shares s
+     JOIN artifacts a ON a.id = s.artifact_id
+     JOIN conversations c ON c.id = a.conversation_id
+     JOIN users u ON u.id = c.user_id
+     WHERE s.user_id = ?
+     ORDER BY s.added_at DESC
+     LIMIT ?`
+  ).all(PREVIEW_CHARS, userId, limit) as Record<string, unknown>[];
+  return rows.map((r) => ({
+    id: r.id as string,
+    conversation_id: r.conversation_id as string,
+    conversation_title: (r.conversation_title as string) ?? "",
+    identifier: r.identifier as string,
+    type: r.type as string,
+    language: (r.language as string) ?? null,
+    title: r.title as string,
+    share_id: (r.share_id as string) ?? null,
+    updated_at: Number(r.updated_at),
+    preview: (r.preview as string) ?? "",
+    owner: (r.owner_name as string) || "someone",
+  }));
+}
