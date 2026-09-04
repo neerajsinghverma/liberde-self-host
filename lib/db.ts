@@ -346,6 +346,11 @@ function createDb(): Database.Database {
     "api_keys",
     "shared_chats",
   ]) {
+  // An agent bundles the same three things a skill can, so a person can hand
+  // out one name instead of a checklist of what to switch on first.
+  ensureColumn(db, "agents", "skill_ids", "TEXT");
+  ensureColumn(db, "agents", "connector_ids", "TEXT");
+  ensureColumn(db, "agents", "http_tool_ids", "TEXT");
     ensureColumn(db, table, "user_id", "TEXT NOT NULL DEFAULT 'local'");
   }
 
@@ -2769,6 +2774,11 @@ export interface Agent {
   instructions: string;
   /** Optional project whose knowledge the agent always has. */
   project_id: string | null;
+  /** Skills this agent always loads, rather than waiting for a task to match. */
+  skill_ids: string[];
+  /** MCP connectors and custom HTTP tools it can always call. */
+  connector_ids: string[];
+  http_tool_ids: string[];
   icon: string;
   created_at: number;
 }
@@ -2798,11 +2808,14 @@ export function createAgent(
     model: fields.model ?? "",
     instructions: fields.instructions ?? "",
     project_id: fields.project_id ?? null,
+    skill_ids: fields.skill_ids ?? [],
+    connector_ids: fields.connector_ids ?? [],
+    http_tool_ids: fields.http_tool_ids ?? [],
     icon: fields.icon || "sparkles",
     created_at: now(),
   };
   db.prepare(
-    "INSERT INTO agents (id, user_id, name, description, model, instructions, project_id, icon, created_at) " +
+    "INSERT INTO agents (id, user_id, name, description, model, instructions, project_id, skill_ids, connector_ids, http_tool_ids, icon, created_at) " +
       "VALUES (@id, @user_id, @name, @description, @model, @instructions, @project_id, @icon, @created_at)"
   ).run(agent);
   return agent;
@@ -2811,7 +2824,20 @@ export function createAgent(
 export function updateAgent(
   id: string,
   userId: string,
-  fields: Partial<Pick<Agent, "name" | "description" | "model" | "instructions" | "project_id" | "icon">>
+  fields: Partial<
+    Pick<
+      Agent,
+      | "name"
+      | "description"
+      | "model"
+      | "instructions"
+      | "project_id"
+      | "icon"
+      | "skill_ids"
+      | "connector_ids"
+      | "http_tool_ids"
+    >
+  >
 ): void {
   const sets: string[] = [];
   const params: unknown[] = [];
@@ -2819,6 +2845,12 @@ export function updateAgent(
     if (fields[key] !== undefined) {
       params.push(fields[key]);
       sets.push(key + " = ?");
+    }
+  }
+  for (const key of ["skill_ids", "connector_ids", "http_tool_ids"] as const) {
+    if (fields[key] !== undefined) {
+      params.push(JSON.stringify(fields[key]));
+      sets.push(`${key} = ?`);
     }
   }
   if (!sets.length) return;

@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "audit": "node scripts/audit-platform.mjs",
+    "test:logic": "tsx scripts/test-logic.ts",
+    "verify": "npm run audit && npm run test:logic && npx tsc --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

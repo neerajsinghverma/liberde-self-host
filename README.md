@@ -157,12 +157,13 @@ Everything is in the single SQLite file. **Backup = copy `data/liberde.db`** (id
 - **MCP connectors** — add any MCP server (**local stdio command or remote HTTP**) in Settings → Connectors; tools become callable mid-conversation. Remote servers support bearer tokens **and the full MCP OAuth 2.1 flow** (discovery, dynamic client registration, PKCE)
 - **Custom HTTP/REST tools** — define your own API endpoints as callable tools: a manual builder with a Test button, **OpenAPI 3.x import**, or let the model add one mid-chat (`create_http_tool`). Per-user secrets, a write-guard on non-GET methods, and skills can bundle tools
 - **Workspaces, roles and spend caps** — owner / admin / member / viewer. An admin can manage members but cannot mint or demote an owner, and the last owner cannot be removed. Set a monthly workspace budget, a per-person allowance, or both; an over-budget request is refused with a message naming the limit it hit, before any model is called
-- **Tamper-evident audit log** (Admin → Audit) — each entry is hashed against the one before it, so an edited or deleted row breaks verification and reports which one. Tool arguments are logged by *name* only, never by value, because the log outlives the conversation. Verify on demand; export JSONL or CEF; retention is configurable and defaults to keeping everything. On SQLite the chain is written inside a single transaction rather than a stored procedure, but the hashed payload is byte-identical to the hosted build, so a chain written by either verifies under both
+- **Tamper-evident audit log** (**Settings → Audit log**) — every entry is hashed against the one before it, so an edited or deleted row breaks verification and the check reports which one. Records logins and failures, key creation and revocation, tool calls, skill imports, membership and budget changes. Tool arguments are logged by *name* only, never by value, because the log outlives the conversation. Verify the chain on demand; export JSONL or CEF for a SIEM; retention is configurable
 - **Prompt caching** — Anthropic and Qwen bill the whole prompt again each turn unless a `cache_control` breakpoint says otherwise; every other family on OpenRouter caches automatically and is left alone. The system prompt is split into a stable head and a volatile tail so the cached prefix stays byte-identical between turns
 - **Parallel agent steps** — the planner marks which steps are independent; those run at the same time while dependent steps stay ordered
 - **Reload mid-reply** — a reply in flight is mirrored server-side, so reloading picks the answer up in progress instead of showing a spinner until it lands
 - **Queued messages** — type while a reply is streaming and it waits rather than vanishing; it sends when the turn finishes
 - **Agent Skills (SKILL.md) interop** — skills follow the open [Agent Skills](https://agentskills.io) standard, so one written for Claude Code, claude.ai, VS Code or Codex loads here unchanged, and yours export the same way. Import single files or a whole skills folder
+- **Agents** — a named configuration you start a chat as: a model, standing instructions, a project's knowledge, the skills it always loads, and the connectors and custom tools it should reach for. Build one in **Settings → Agents**; start a chat as it from the chips under the greeting on a new chat. Its model and project are *defaults* — anything the conversation says outranks them, because switching mid-thread is a deliberate act an agent should not undo. Unlike a skill (which waits for a matching task) an agent's skills are in force from the first message
 - **Skills** — reusable procedures with progressive disclosure (the model loads full instructions only when the task matches); can reference connector and custom-tool names
 - **Voice conversations** (🎧), **editable artifacts** (✏ / select-and-💬), **office exports** (slides → .pptx, docs → .doc)
 - **Code interpreter, in the browser** — the model writes code, runs it, and reads the output (`<liberdeRun>`). Two runtimes share the tag: JavaScript for instant arithmetic and logic checks, and **Python** — real CPython in WebAssembly with pandas, numpy, matplotlib, scipy, scikit-learn and openpyxl, loaded on demand from the code's own imports. Conversation attachments are mounted as real files at `/data`, anything written to `/out` comes back as a download (matplotlib figures are captured automatically), and the kernel is kept alive per conversation so variables and dataframes survive between blocks. It runs in a sandboxed frame with an opaque origin on the user's own machine: no server, no per-run cost, nothing to configure, and identical behaviour on a self-hosted install
@@ -198,7 +199,7 @@ Liberde implements the same artifact architecture as Claude.ai:
 
 ## Platform API
 
-Create a key in **Settings → Platform API keys**, then call the server like any OpenAI-compatible endpoint:
+Create a key in **Settings → Keys**, then call the server like any OpenAI-compatible endpoint:
 
 ```bash
 curl http://localhost:3000/v1/chat/completions \
@@ -240,6 +241,23 @@ Set `LIBERDE_URL` to point the shell at a remote Liberde server.
 - `app/api/chat/route.ts` — the streaming pipeline: persists the user turn, streams SSE deltas, runs the tool loop, persists the assistant turn (also on client abort), then auto-titles new conversations
 - `app/v1/*` — the platform API; authenticates `lbd-` keys (SHA-256 hashes) and proxies to OpenRouter
 - `components/AppShell.tsx` — a single client shell using `history.pushState` navigation so streams survive route changes
+
+## Verifying a change
+
+```bash
+npm run verify        # audit + logic tests + typecheck
+```
+
+Three checks, because a green build proves less than it looks like it does:
+
+| Command | Asks |
+|---|---|
+| `npm run audit` | Can a person **reach** every feature? Does the **other edition** have it? Does the **documentation** describe something that exists? Is each capability **wired end to end**? |
+| `npm run test:logic` | Is the logic **right** — routing tiers, budget rules, the audit hash chain, retrieval, conformance, artifact parsing, SSRF? |
+
+The audit exists because four features once shipped that no screen could reach, two of
+them documented as though they had a home. Types and builds were green throughout —
+neither asks whether a user can get to the thing.
 
 ## Security
 

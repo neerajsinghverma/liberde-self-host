@@ -7,6 +7,7 @@ import {
   getConversation,
   getLastAssistantModel,
   getDesignSystem,
+  getAgent,
   getProject,
   listMessages,
   listProjectFiles,
@@ -61,7 +62,7 @@ import { bodyTooLarge, attachmentsProblem, MAX_CONTENT_CHARS } from "@/lib/limit
 import { resolveChatTarget, targetHeaders, type ChatTarget } from "@/lib/providers";
 import { applyPromptCache, cacheSessionId, readCacheStats } from "@/lib/prompt-cache";
 import { checkBudgets } from "@/lib/workspaces";
-import { assembleTools, callTool } from "@/lib/mcp";
+import { assembleTools, callTool, agentBundleBlock } from "@/lib/mcp";
 import { assembleHttpTools, execHttpTool } from "@/lib/http-tools";
 import {
   BUILTIN_TOOL_DEFS,
@@ -181,8 +182,11 @@ export async function POST(req: NextRequest) {
     return Response.json({ error: "Conversation not found" }, { status: 404 });
   }
   const settings = await getSettings(userId);
+  const agent = conversation.agent_id
+    ? await getAgent(conversation.agent_id, userId)
+    : null;
   const requestedModel =
-    body.model || conversation.model || settings.defaultModel;
+    body.model || conversation.model || agent?.model || settings.defaultModel;
   const isExtModel = requestedModel.startsWith("ext:");
   if (!isExtModel) {
     const key = await getApiKey(userId);
@@ -265,9 +269,13 @@ export async function POST(req: NextRequest) {
     return Response.json({ error: "Nothing to respond to" }, { status: 400 });
   }
 
-  const project = conversation.project_id
-    ? await getProject(conversation.project_id)
-    : null;
+  // An agent contributes three things to a turn: standing instructions, a
+  // model when the conversation has not been switched off it, and a project
+  // whose knowledge it always has. Its own project only applies when the
+  // conversation is not already in one — an explicit choice by the user
+  // outranks the agent's default.
+  const projectId = conversation.project_id ?? agent?.project_id ?? null;
+  const project = projectId ? await getProject(projectId) : null;
   const lastUserContent =
     [...history].reverse().find((m) => m.role === "user")?.content ?? "";
   const systemParts = await buildSystemPromptParts(
@@ -364,7 +372,18 @@ Only reply in plain text for a genuine question that clearly isn't a design requ
   // (which carries the prompt-cache breakpoint); everything that moves — the
   // date, retrieved project knowledge, saved memories — goes in a tail block
   // placed after the conversation, outside the cached prefix.
+  const agentBundles = agent ? await agentBundleBlock(agent, userId) : "";
+  const agentDirective = agent
+    ? [
+        agent.instructions.trim() || agentBundles ? "# " + agent.name : "",
+        agent.instructions.trim(),
+        agentBundles,
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    : "";
   const stableSystemPrompt = [
+    agentDirective,
     designDirective,
     designSystemBlock,
     styleDirective,
