@@ -229,6 +229,19 @@ function createDb(): Database.Database {
       text TEXT NOT NULL DEFAULT '',
       updated_at INTEGER NOT NULL
     );
+    -- Agents: a named, reusable configuration to start a chat as.
+    CREATE TABLE IF NOT EXISTS agents (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      model TEXT NOT NULL DEFAULT '',
+      instructions TEXT NOT NULL DEFAULT '',
+      project_id TEXT,
+      icon TEXT NOT NULL DEFAULT 'sparkles',
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS agents_user_idx ON agents (user_id);
     -- Chunk embeddings (see lib/rag.ts). Keyed by model: changing the
     -- embedding model invalidates nothing, it just stops matching, so old
     -- rows are ignored and re-indexed rather than silently compared against
@@ -362,6 +375,7 @@ function createDb(): Database.Database {
   ensureColumn(db, "skills", "http_tool_ids", "TEXT");
   ensureColumn(db, "conversations", "locked_at", "INTEGER");
   ensureColumn(db, "conversations", "mode", "TEXT NOT NULL DEFAULT 'chat'");
+  ensureColumn(db, "conversations", "agent_id", "TEXT");
   db.exec(`
     CREATE TABLE IF NOT EXISTS branches (
       id TEXT PRIMARY KEY,
@@ -844,7 +858,8 @@ export function createConversation(
   projectId: string | null = null,
   isTemp = false,
   userId: string = DEFAULT_USER,
-  mode: string = "chat"
+  mode: string = "chat",
+  agentId: string | null = null
 ): Conversation {
   const conv: Conversation = {
     id: newId(),
@@ -854,12 +869,13 @@ export function createConversation(
     is_temp: isTemp ? 1 : 0,
     user_id: userId,
     mode,
+    agent_id: agentId,
     created_at: now(),
     updated_at: now(),
   };
   db.prepare(
-    "INSERT INTO conversations (id, title, model, project_id, is_temp, user_id, mode, created_at, updated_at) VALUES (@id, @title, @model, @project_id, @is_temp, @user_id, @mode, @created_at, @updated_at)"
-  ).run(conv);
+    "INSERT INTO conversations (id, title, model, project_id, is_temp, user_id, mode, agent_id, created_at, updated_at) VALUES (@id, @title, @model, @project_id, @is_temp, @user_id, @mode, @agent_id, @created_at, @updated_at)"
+  ).run({ ...conv, agent_id: conv.agent_id ?? null });
   return conv;
 }
 
@@ -2738,4 +2754,83 @@ export function indexedFileIds(projectId: string, model: string): Set<string> {
     .prepare("SELECT DISTINCT file_id FROM chunk_embeddings WHERE project_id = ? AND model = ?")
     .all(projectId, model) as { file_id: string }[];
   return new Set(rows.map((r) => r.file_id));
+}
+
+// ---------------------------------------------------------------------------
+// Agents: a named, reusable configuration you can start a chat as
+
+export interface Agent {
+  id: string;
+  user_id: string;
+  name: string;
+  description: string;
+  /** Empty means the agent does not override the conversation's model. */
+  model: string;
+  instructions: string;
+  /** Optional project whose knowledge the agent always has. */
+  project_id: string | null;
+  icon: string;
+  created_at: number;
+}
+
+export function listAgents(userId: string): Agent[] {
+  return db
+    .prepare("SELECT * FROM agents WHERE user_id = ? ORDER BY name ASC")
+    .all(userId) as Agent[];
+}
+
+export function getAgent(id: string, userId: string): Agent | null {
+  return (
+    (db.prepare("SELECT * FROM agents WHERE id = ? AND user_id = ?").get(id, userId) as Agent) ??
+    null
+  );
+}
+
+export function createAgent(
+  fields: Partial<Omit<Agent, "id" | "user_id" | "created_at">> & { name: string },
+  userId: string
+): Agent {
+  const agent: Agent = {
+    id: newId(),
+    user_id: userId,
+    name: fields.name,
+    description: fields.description ?? "",
+    model: fields.model ?? "",
+    instructions: fields.instructions ?? "",
+    project_id: fields.project_id ?? null,
+    icon: fields.icon || "sparkles",
+    created_at: now(),
+  };
+  db.prepare(
+    "INSERT INTO agents (id, user_id, name, description, model, instructions, project_id, icon, created_at) " +
+      "VALUES (@id, @user_id, @name, @description, @model, @instructions, @project_id, @icon, @created_at)"
+  ).run(agent);
+  return agent;
+}
+
+export function updateAgent(
+  id: string,
+  userId: string,
+  fields: Partial<Pick<Agent, "name" | "description" | "model" | "instructions" | "project_id" | "icon">>
+): void {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  for (const key of ["name", "description", "model", "instructions", "project_id", "icon"] as const) {
+    if (fields[key] !== undefined) {
+      params.push(fields[key]);
+      sets.push(key + " = ?");
+    }
+  }
+  if (!sets.length) return;
+  params.push(id, userId);
+  db.prepare("UPDATE agents SET " + sets.join(", ") + " WHERE id = ? AND user_id = ?").run(
+    ...params
+  );
+}
+
+export function deleteAgent(id: string, userId: string): void {
+  // Conversations keep their history; they just stop being bound to an agent
+  // that no longer exists.
+  db.prepare("UPDATE conversations SET agent_id = NULL WHERE agent_id = ?").run(id);
+  db.prepare("DELETE FROM agents WHERE id = ? AND user_id = ?").run(id, userId);
 }
