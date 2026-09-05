@@ -266,7 +266,7 @@ Set `LIBERDE_URL` to point the shell at a remote Liberde server.
 npm run verify        # audit + logic tests + typecheck
 ```
 
-Five checks, because a green build proves less than it looks like it does:
+Six checks, because a green build proves less than it looks like it does:
 
 | Command | Asks |
 |---|---|
@@ -274,6 +274,7 @@ Five checks, because a green build proves less than it looks like it does:
 | `npm run test:logic` | Is the logic **right** — routing tiers, budget rules, the audit hash chain, retrieval, conformance, artifact parsing, SSRF? |
 | `npm run test:browser` | Does Pyodide actually **boot** in a sandboxed iframe, read a CSV, draw a chart, and keep state between blocks? Real headless Chromium. |
 | `npm run test:e2e` | Can a **new account** sign up, open every settings tab, create an agent and start a chat as it? Drives the real app; run it against a local self-host build, never production. |
+| `npm run test:soak` | Does an **ordinary session** hold its invariants throughout — no machine tag ever visible, no internal error string shown, no collapsed container, no silent stall — across chat, analysis, artifacts, maths, second opinion, design, plan, the gallery, every settings tab and phone width? |
 
 The audit exists because four features once shipped that no screen could reach, two of
 them documented as though they had a home. Types and builds were green throughout —
