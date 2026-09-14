@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import { encryptSecret, decryptSecret } from "./crypto-secrets";
+import { scrubText } from "./text-safe";
 import {
   can,
   isWorkspaceRole,
@@ -978,10 +979,13 @@ export function addMessage(
     id: newId(),
     conversation_id: conversationId,
     role,
-    content,
+    // Tool results are arbitrary bytes off the internet. A NUL or a lone
+    // surrogate in one has no valid TEXT representation — Postgres rejects the
+    // INSERT outright, SQLite quietly truncates — so scrub before storing.
+    content: scrubText(content),
     model,
     attachments,
-    reasoning: extras.reasoning ?? null,
+    reasoning: extras.reasoning ? scrubText(extras.reasoning) : (extras.reasoning ?? null),
     annotations: (extras.annotations as Message["annotations"]) ?? null,
     images: extras.images ?? null,
     tool_calls: extras.tool_calls ?? null,
