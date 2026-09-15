@@ -475,6 +475,33 @@ function createDb(): Database.Database {
   // Sign-in method: 'password' or 'google' (OAuth accounts have no password).
   ensureColumn(db, "users", "auth_provider", "TEXT NOT NULL DEFAULT 'password'");
 
+  // Present templates: a brand a user supplied, extracted from screenshots of a
+  // real deck, from a brand guidelines document, or saved from a deck they had
+  // already got right. tokens/layouts/layout_css are JSON blobs, sanitised on
+  // the way in by lib/deck-template.ts before they ever reach a stylesheet.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS deck_templates (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      source TEXT NOT NULL,
+      tokens TEXT NOT NULL,
+      fonts_query TEXT,
+      image_style TEXT,
+      logo TEXT,
+      logo_pos TEXT,
+      layout_css TEXT,
+      layouts TEXT NOT NULL,
+      notes TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  // Which template a Present conversation is pinned to, and whether it should
+  // follow the template's own layouts or only its brand skin.
+  ensureColumn(db, "conversations", "deck_template_id", "TEXT");
+  ensureColumn(db, "conversations", "deck_template_mode", "TEXT");
+
   // Published-deck analytics: one row per card a viewer actually dwelt on, so
   // the owner can see which cards held attention. Anonymous by construction —
   // a published page runs at an opaque origin and has no session, so the only
@@ -906,7 +933,14 @@ export function updateConversation(
   fields: Partial<
     Pick<
       Conversation,
-      "title" | "model" | "project_id" | "starred" | "archived" | "design_system_id"
+      | "title"
+      | "model"
+      | "project_id"
+      | "starred"
+      | "archived"
+      | "design_system_id"
+      | "deck_template_id"
+      | "deck_template_mode"
     >
   >
 ) {
@@ -916,12 +950,14 @@ export function updateConversation(
     starred: 0,
     archived: 0,
     design_system_id: null as string | null,
+    deck_template_id: null as string | null,
+    deck_template_mode: null as string | null,
     ...conv,
     ...fields,
     updated_at: now(),
   };
   db.prepare(
-    "UPDATE conversations SET title = @title, model = @model, project_id = @project_id, starred = @starred, archived = @archived, design_system_id = @design_system_id, updated_at = @updated_at WHERE id = @id"
+    "UPDATE conversations SET title = @title, model = @model, project_id = @project_id, starred = @starred, archived = @archived, design_system_id = @design_system_id, deck_template_id = @deck_template_id, deck_template_mode = @deck_template_mode, updated_at = @updated_at WHERE id = @id"
   ).run(merged);
 }
 
@@ -1792,6 +1828,154 @@ export function deleteArtifactsForConversation(conversationId: string) {
     db.prepare("DELETE FROM deck_views WHERE artifact_id = ?").run(id);
     db.prepare("DELETE FROM artifacts WHERE id = ?").run(id);
   }
+}
+
+/* ---------------------------------------------------- Present templates ---- */
+
+type DeckTemplateRow = {
+  id: string;
+  user_id: string;
+  name: string;
+  source: string;
+  tokens: string;
+  fonts_query: string | null;
+  image_style: string | null;
+  logo: string | null;
+  logo_pos: string | null;
+  layout_css: string | null;
+  layouts: string;
+  notes: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+/** Rows carry JSON; callers want objects. A corrupt blob degrades to empty. */
+function hydrateTemplate(row: DeckTemplateRow) {
+  const parse = <T>(raw: string, fallback: T): T => {
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return fallback;
+    }
+  };
+  return {
+    ...row,
+    tokens: parse<Record<string, string>>(row.tokens, {}),
+    layouts: parse<{ id: string; label: string; hint: string }[]>(row.layouts, []),
+  };
+}
+
+export function listDeckTemplates(userId: string = DEFAULT_USER) {
+  const rows = db
+    .prepare("SELECT * FROM deck_templates WHERE user_id = ? ORDER BY updated_at DESC")
+    .all(userId) as DeckTemplateRow[];
+  return rows.map(hydrateTemplate);
+}
+
+export function getDeckTemplate(id: string, userId?: string) {
+  const row = db.prepare("SELECT * FROM deck_templates WHERE id = ?").get(id) as
+    | DeckTemplateRow
+    | undefined;
+  if (!row) return undefined;
+  if (userId && row.user_id !== userId) return undefined;
+  return hydrateTemplate(row);
+}
+
+export function createDeckTemplate(
+  t: {
+    name: string;
+    source: string;
+    tokens: Record<string, string>;
+    fonts_query?: string | null;
+    image_style?: string | null;
+    logo?: string | null;
+    logo_pos?: string | null;
+    layout_css?: string | null;
+    layouts: { id: string; label: string; hint: string }[];
+    notes?: string | null;
+  },
+  userId: string = DEFAULT_USER
+) {
+  const now = Date.now();
+  const id = newId();
+  db.prepare(
+    `INSERT INTO deck_templates
+     (id,user_id,name,source,tokens,fonts_query,image_style,logo,logo_pos,layout_css,layouts,notes,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    userId,
+    t.name,
+    t.source,
+    JSON.stringify(t.tokens),
+    t.fonts_query ?? null,
+    t.image_style ?? null,
+    t.logo ?? null,
+    t.logo_pos ?? null,
+    t.layout_css ?? null,
+    JSON.stringify(t.layouts),
+    t.notes ?? null,
+    now,
+    now
+  );
+  return getDeckTemplate(id)!;
+}
+
+export function updateDeckTemplate(
+  id: string,
+  patch: Partial<{
+    name: string;
+    tokens: Record<string, string>;
+    fonts_query: string | null;
+    image_style: string | null;
+    logo: string | null;
+    logo_pos: string | null;
+    layout_css: string | null;
+    layouts: { id: string; label: string; hint: string }[];
+    notes: string | null;
+  }>,
+  userId?: string
+) {
+  const existing = getDeckTemplate(id, userId);
+  if (!existing) return undefined;
+  const next = {
+    name: patch.name ?? existing.name,
+    tokens: JSON.stringify(patch.tokens ?? existing.tokens),
+    fonts_query: patch.fonts_query !== undefined ? patch.fonts_query : existing.fonts_query,
+    image_style: patch.image_style !== undefined ? patch.image_style : existing.image_style,
+    logo: patch.logo !== undefined ? patch.logo : existing.logo,
+    logo_pos: patch.logo_pos !== undefined ? patch.logo_pos : existing.logo_pos,
+    layout_css: patch.layout_css !== undefined ? patch.layout_css : existing.layout_css,
+    layouts: JSON.stringify(patch.layouts ?? existing.layouts),
+    notes: patch.notes !== undefined ? patch.notes : existing.notes,
+  };
+  db.prepare(
+    `UPDATE deck_templates SET name=?,tokens=?,fonts_query=?,image_style=?,logo=?,logo_pos=?,layout_css=?,layouts=?,notes=?,updated_at=?
+     WHERE id=?`
+  ).run(
+    next.name,
+    next.tokens,
+    next.fonts_query,
+    next.image_style,
+    next.logo,
+    next.logo_pos,
+    next.layout_css,
+    next.layouts,
+    next.notes,
+    Date.now(),
+    id
+  );
+  return getDeckTemplate(id)!;
+}
+
+export function deleteDeckTemplate(id: string, userId?: string) {
+  const existing = getDeckTemplate(id, userId);
+  if (!existing) return false;
+  db.prepare("DELETE FROM deck_templates WHERE id = ?").run(id);
+  // A conversation pinned to a deleted template degrades to the built-in themes
+  // rather than failing to render.
+  db.prepare("UPDATE conversations SET deck_template_id = NULL WHERE deck_template_id = ?").run(id);
+  return true;
 }
 
 /** One card's dwell time from a published deck. Anonymous; never linked to a user. */
