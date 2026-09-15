@@ -8,11 +8,14 @@
     "start": "next start",
     "audit": "node scripts/audit-platform.mjs",
     "test:logic": "tsx scripts/test-logic.ts",
-    "verify": "npm run audit && npm run test:logic && npx tsc --noEmit && npm run test:browser",
+    "verify": "npm run audit && npm run test:logic && npm run test:deck && npx tsc --noEmit && npm run test:browser",
     "test:browser": "tsx scripts/test-sandbox-browser.ts",
     "test:e2e": "tsx scripts/test-e2e.ts",
     "test:live": "tsx scripts/test-live-chat.ts",
-    "test:soak": "tsx scripts/test-soak.ts"
+    "test:soak": "tsx scripts/test-soak.ts",
+    "test:deck": "tsx scripts/test-deck.ts && tsx scripts/test-deck-browser.ts",
+    "test:present": "tsx scripts/test-present-ui.ts",
+    "test:present:live": "tsx scripts/test-present-live.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

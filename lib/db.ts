@@ -475,6 +475,21 @@ function createDb(): Database.Database {
   // Sign-in method: 'password' or 'google' (OAuth accounts have no password).
   ensureColumn(db, "users", "auth_provider", "TEXT NOT NULL DEFAULT 'password'");
 
+  // Published-deck analytics: one row per card a viewer actually dwelt on, so
+  // the owner can see which cards held attention. Anonymous by construction —
+  // a published page runs at an opaque origin and has no session, so the only
+  // identity is a random per-view id the page makes up for itself.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS deck_views (
+      id TEXT PRIMARY KEY,
+      artifact_id TEXT NOT NULL,
+      view_id TEXT NOT NULL,
+      card INTEGER NOT NULL,
+      ms INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+  `);
+
   // Indexes for per-user / per-parent lookups. All referenced tables + columns
   // exist by now; each guarded so one failure can't wedge startup.
   for (const stmt of [
@@ -488,6 +503,7 @@ function createDb(): Database.Database {
     "CREATE INDEX IF NOT EXISTS idx_providers_user ON providers(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_shared_chats_user ON shared_chats(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_deck_views_artifact ON deck_views(artifact_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_branches_conversation ON branches(conversation_id)",
     "CREATE INDEX IF NOT EXISTS idx_artifacts_conversation ON artifacts(conversation_id)",
     "CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact ON artifact_versions(artifact_id)",
@@ -1773,8 +1789,42 @@ export function deleteArtifactsForConversation(conversationId: string) {
     .all(conversationId) as { id: string }[];
   for (const { id } of ids) {
     db.prepare("DELETE FROM artifact_versions WHERE artifact_id = ?").run(id);
+    db.prepare("DELETE FROM deck_views WHERE artifact_id = ?").run(id);
     db.prepare("DELETE FROM artifacts WHERE id = ?").run(id);
   }
+}
+
+/** One card's dwell time from a published deck. Anonymous; never linked to a user. */
+export function recordDeckView(
+  artifactId: string,
+  viewId: string,
+  card: number,
+  ms: number
+) {
+  db.prepare(
+    "INSERT INTO deck_views (id, artifact_id, view_id, card, ms, created_at) VALUES (?,?,?,?,?,?)"
+  ).run(crypto.randomUUID(), artifactId, viewId.slice(0, 64), card, Math.min(ms, 3_600_000), Date.now());
+}
+
+export interface DeckAnalytics {
+  views: number;
+  totalMs: number;
+  cards: { card: number; views: number; ms: number }[];
+}
+
+/** Per-card attention for a published deck: how many people, and where they stopped. */
+export function getDeckAnalytics(artifactId: string): DeckAnalytics {
+  const rows = db
+    .prepare(
+      "SELECT card, COUNT(DISTINCT view_id) AS views, SUM(ms) AS ms FROM deck_views WHERE artifact_id = ? GROUP BY card ORDER BY card"
+    )
+    .all(artifactId) as { card: number; views: number; ms: number }[];
+  const total = db
+    .prepare(
+      "SELECT COUNT(DISTINCT view_id) AS views, COALESCE(SUM(ms),0) AS ms FROM deck_views WHERE artifact_id = ?"
+    )
+    .get(artifactId) as { views: number; ms: number };
+  return { views: total?.views ?? 0, totalMs: total?.ms ?? 0, cards: rows };
 }
 
 /** Remove versions created by deleted messages; drop artifacts left with no versions. */
